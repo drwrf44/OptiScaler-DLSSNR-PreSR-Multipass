@@ -664,7 +664,7 @@ void ConsumeCalibrationReadback()
     const float litFraction = tiles.empty() ? 0.0f : (float) lit / (float) tiles.size();
     if (!(tiles[nth] > 0.0f) || tiles[nth] >= 1999.0f) return;
 
-    const float suggestion = std::clamp(tiles[nth], 0.25f, 1990.0f);
+    const suggestion = std::clamp(tiles[nth], 0.25f, 1990.0f);
     g_nr.calibUsable = !g_nr.calibPassthrough && litFraction > 0.20f;
     g_nr.calibWhy = g_nr.calibPassthrough  ? "this game hands over a frame it already tone mapped, so there is nothing to normalise"
                     : litFraction <= 0.20f ? "too little of this scene is lit to say where the top of the range is"
@@ -1161,20 +1161,19 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     const unsigned int fullMotionWidth = (unsigned int) motionDesc.Width;
     const unsigned int fullMotionHeight = motionDesc.Height;
 
-    unsigned int wantedMotionWidth = fullMotionWidth;
-    unsigned int wantedMotionHeight = fullMotionHeight;
-
-    if (frame.MotionVectorsLowResolution)
-    {
-        wantedMotionWidth = (frame.RenderSubrectWidth != 0) ? frame.RenderSubrectWidth : guideWidth;
-        wantedMotionHeight = (frame.RenderSubrectHeight != 0) ? frame.RenderSubrectHeight : guideHeight;
-        wantedMotionWidth = std::min(wantedMotionWidth, fullMotionWidth);
-        wantedMotionHeight = std::min(wantedMotionHeight, fullMotionHeight);
-    }
+    unsigned int wantedMotionWidth = frame.MotionVectorsLowResolution
+        ? ((frame.RenderSubrectWidth != 0) ? frame.RenderSubrectWidth : guideWidth)
+        : width;
+    unsigned int wantedMotionHeight = frame.MotionVectorsLowResolution
+        ? ((frame.RenderSubrectHeight != 0) ? frame.RenderSubrectHeight : guideHeight)
+        : height;
+    wantedMotionWidth = std::min(wantedMotionWidth, fullMotionWidth);
+    wantedMotionHeight = std::min(wantedMotionHeight, fullMotionHeight);
 
     const unsigned int motionWidth =
         std::min(wantedMotionWidth, (unsigned int) motionDesc.Width - motionBaseX);
-    const unsigned int motionHeight = std::min(wantedMotionHeight, motionDesc.Height - motionBaseY);
+    const unsigned int motionHeight =
+        std::min(wantedMotionHeight, motionDesc.Height - motionBaseY);
 
     g_nr.guideWidth = guideWidth;
     g_nr.guideHeight = guideHeight;
@@ -1329,7 +1328,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             LOG_ERROR("DLSS-NR: could not allocate the model-output ping-pong; extra passes are disabled");
     }
 
-    if (reduced && g_nr.colorSmall == nullptr)
+    if (reduced && g_nr.colorSmall != nullptr)
         g_nr.colorSmall = CreateScratch(device, desc.Format, workWidth, workHeight);
 
     if (workScale > 1.0f && g_nr.outputNative == nullptr)
@@ -1791,14 +1790,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     }
 
     // Motion vector reference space resolution calculation (works accurately for both Pre-SR and Post-SR)
-    float mvSourceWidth = (float) motionDesc.Width;
-    float mvSourceHeight = (float) motionDesc.Height;
-
-    if (frame.MotionVectorsLowResolution)
-    {
-        mvSourceWidth = (frame.RenderSubrectWidth > 0) ? (float) frame.RenderSubrectWidth : (float) wantedMotionWidth;
-        mvSourceHeight = (frame.RenderSubrectHeight > 0) ? (float) frame.RenderSubrectHeight : (float) wantedMotionHeight;
-    }
+    float mvSourceWidth = frame.MotionVectorsLowResolution
+        ? ((frame.RenderSubrectWidth > 0) ? (float) frame.RenderSubrectWidth : (float) wantedMotionWidth)
+        : (float) width;
+    float mvSourceHeight = frame.MotionVectorsLowResolution
+        ? ((frame.RenderSubrectHeight > 0) ? (float) frame.RenderSubrectHeight : (float) wantedMotionHeight)
+        : (float) height;
 
     const float mvToWorkX = (mvSourceWidth > 0.0f) ? ((float) workWidth / mvSourceWidth) : 1.0f;
     const float mvToWorkY = (mvSourceHeight > 0.0f) ? ((float) workHeight / mvSourceHeight) : 1.0f;
@@ -2118,11 +2115,11 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         g_nr.reason = "the model refused to run";
         LOG_ERROR("DLSS-NR evaluate returned 0x{:X} ({}), disabling for this session", (uint32_t) result,
                   NgxResultName((unsigned int) result));
-    }
 
-    MakeModelWritable(g_nr.output);
-    if (g_nr.passScratch != nullptr)
-        MakeModelWritable(g_nr.passScratch);
+        MakeModelWritable(g_nr.output);
+        if (g_nr.passScratch != nullptr)
+            MakeModelWritable(g_nr.passScratch);
+    }
 
     Barrier(cmdList, g_nr.hdrCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

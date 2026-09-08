@@ -664,7 +664,7 @@ void ConsumeCalibrationReadback()
     const float litFraction = tiles.empty() ? 0.0f : (float) lit / (float) tiles.size();
     if (!(tiles[nth] > 0.0f) || tiles[nth] >= 1999.0f) return;
 
-    const suggestion = std::clamp(tiles[nth], 0.25f, 1990.0f);
+    const float suggestion = std::clamp(tiles[nth], 0.25f, 1990.0f);
     g_nr.calibUsable = !g_nr.calibPassthrough && litFraction > 0.20f;
     g_nr.calibWhy = g_nr.calibPassthrough  ? "this game hands over a frame it already tone mapped, so there is nothing to normalise"
                     : litFraction <= 0.20f ? "too little of this scene is lit to say where the top of the range is"

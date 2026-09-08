@@ -1378,14 +1378,17 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
         const auto tuning = PassTuning(cfg, 0);
-        // Tối ưu hóa Intensity khi tạo feature cho Pre-SR để chống bệt
-        const float createIntensity = frame.BeforeUpscale ? std::clamp(tuning.intensity * 0.7f, 0.15f, 0.45f) : tuning.intensity;
+
+        // NÂNG CẤP CHẤT LƯỢNG KHI TẠO FEATURE PRE-SR:
+        const float createIntensity = frame.BeforeUpscale ? std::clamp(tuning.intensity * 0.8f, 0.25f, 0.55f) : tuning.intensity;
+        const float createStructure = frame.BeforeUpscale ? std::max(tuning.structure, 0.85f) : tuning.structure;
+
         g_nr.feature =
             g_nr.create(snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
                         device, cmdList, g_nr.capabilityParams, workWidth, workHeight,
                         (int) PassPreset(cfg, 0),
                         createIntensity, (int) PassStyle(cfg, 0),
-                        tuning.structure, tuning.tone, tuning.skin,
+                        createStructure, tuning.tone, tuning.skin,
                         tuning.autoMask ? 1 : 0, 1);
 
         if (g_nr.feature == nullptr)
@@ -1486,13 +1489,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             {
                 SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
                 const auto tuning = PassTuning(cfg, pass);
-                const float passCreateIntensity = frame.BeforeUpscale ? std::clamp(tuning.intensity * 0.7f, 0.15f, 0.45f) : tuning.intensity;
+                const float passCreateIntensity = frame.BeforeUpscale ? std::clamp(tuning.intensity * 0.8f, 0.25f, 0.55f) : tuning.intensity;
+                const float passCreateStructure = frame.BeforeUpscale ? std::max(tuning.structure, 0.85f) : tuning.structure;
+
                 g_nr.passFeature[pass] = g_nr.create(
                     snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
                     device, cmdList, g_nr.capabilityParams, workWidth, workHeight,
                     (int) PassPreset(cfg, pass), passCreateIntensity,
                     (int) PassStyle(cfg, pass),
-                    tuning.structure, tuning.tone, tuning.skin,
+                    passCreateStructure, tuning.tone, tuning.skin,
                     tuning.autoMask ? 1 : 0, 1);
 
                 if (g_nr.passFeature[pass] != nullptr)
@@ -1785,7 +1790,6 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         return;
     }
 
-    // FIX CHO PRE-SR: Tự động chia tỉ lệ vector theo đúng nguồn gốc xuất phát của nó (Render hay Display)
     const float mvRefWidth = (float)(frame.MotionVectorsLowResolution ? width : motionDesc.Width);
     const float mvRefHeight = (float)(frame.MotionVectorsLowResolution ? height : motionDesc.Height);
 
@@ -1880,11 +1884,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         const bool passReset = g_nr.reset || (pass > 0 && g_nr.passNeedsReset[pass]);
         const auto tuning = PassTuning(cfg, pass);
 
-        // THUẬT TOÁN CHỐNG NHÒE KÉP (ANTI-SMEAR):
-        // Khi chạy Pre-SR, tự động điều tiết intensity để triệt tiêu việc lưu bóng ma chồng lấn với DLSS SR
+        // NÂNG CẤP ĐỘ NÉT VÀ KHỬ BÓNG MA CHO PRE-SR:
         const float passIntensity = frame.BeforeUpscale
-            ? std::clamp(tuning.intensity * 0.7f, 0.15f, 0.45f)
+            ? std::clamp(tuning.intensity * 0.8f, 0.25f, 0.55f)
             : tuning.intensity;
+        const float passStructure = frame.BeforeUpscale
+            ? std::max(tuning.structure, 0.85f)
+            : tuning.structure;
 
         MakeModelWritable(passOutput);
         result = g_nr.evaluate(
@@ -1892,7 +1898,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             workWidth, workHeight, guideWidth, guideHeight, motionWidth, motionHeight, depthBaseX,
             depthBaseY, motionBaseX, motionBaseY, g_nr.guideDepthInverted ? 1 : 0,
             passReset ? 1 : 0, passIntensity,
-            (int) PassStyle(cfg, pass), tuning.structure,
+            (int) PassStyle(cfg, pass), passStructure,
             tuning.tone, tuning.skin,
             tuning.autoMask ? 1 : 0, g_nr.guideMvScaleX * mvToWorkX,
             g_nr.guideMvScaleY * mvToWorkY);
@@ -1979,7 +1985,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.ExposurePreMul = exposurePreMul;
         resolveParams.Width = width;
         resolveParams.Height = height;
-        resolveParams.TransferStrength = cfg.DlssNrTransferStrength.value_or_default();
+
+        // Tự động giữ lại 85% - 100% chi tiết cho Pre-SR để tăng tối đa độ nét
+        resolveParams.TransferStrength = frame.BeforeUpscale
+            ? std::max(cfg.DlssNrTransferStrength.value_or_default(), 0.85f)
+            : cfg.DlssNrTransferStrength.value_or_default();
+
         const auto strength = [](float v) { return std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 1.0f; };
         resolveParams.SkinProtection = cfg.DlssNrSkinProtection.value_or_default();
         resolveParams.ShowSkinMask = cfg.DlssNrShowSkinMask.value_or_default();
@@ -1990,7 +2001,6 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.ColourStrength = cfg.DlssNrColourStrength.value_or_default();
         resolveParams.DebugView = cfg.DlssNrDebugView.value_or_default();
         resolveParams.MaxRatio = cfg.DlssNrMaxRatio.value_or_default();
-        // Tự động kích hoạt Matched Residual (1) cho Pre-SR để không làm bệt khung hình
         resolveParams.Transfer = frame.BeforeUpscale ? 1u : cfg.DlssNrTransfer.value_or_default();
         resolveParams.DebugScale = cfg.DlssNrWhitePointScale.value_or_default();
         resolveParams.Passthrough = isHdrBuffer ? 0u : 1u;
@@ -2347,7 +2357,6 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
             frame.Reset = gameReset != 0;
     }
 
-    // Guides subrect & base dimensions (Motion Vector Fix)
     params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &frame.RenderSubrectWidth);
     params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &frame.RenderSubrectHeight);
     params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &frame.DepthSubrectBaseX);

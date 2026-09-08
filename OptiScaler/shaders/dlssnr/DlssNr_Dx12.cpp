@@ -126,7 +126,7 @@ void ProbeProxyDispatch(ID3D12GraphicsCommandList* cmdList)
         destroy(params);
 }
 
-// Updated to 27 parameters to support independent Motion Vector / Depth subrects (Motion Vector Fix)
+// 27 parameters signature (Motion Vector Fix)
 using PFN_NrCreate = void*(__cdecl*) (const wchar_t*, const wchar_t*, ID3D12Device*,
                                       ID3D12GraphicsCommandList*, void*, unsigned int, unsigned int, int,
                                       float, int, float, float, float, int, int);
@@ -1150,7 +1150,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         guideHeight = subH;
     }
 
-    // --- MOTION VECTOR FIX (cmh1448) APPLIED HERE ---
+    // --- MOTION VECTOR FIX CHO CẢ POST-SR VÀ PRE-SR ---
     const unsigned int depthBaseX = std::min(frame.DepthSubrectBaseX, (unsigned int) guideDesc.Width);
     const unsigned int depthBaseY = std::min(frame.DepthSubrectBaseY, guideDesc.Height);
     guideWidth = std::min(guideWidth, (unsigned int) guideDesc.Width - depthBaseX);
@@ -1158,8 +1158,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     const unsigned int motionBaseX = std::min(frame.MotionSubrectBaseX, (unsigned int) motionDesc.Width);
     const unsigned int motionBaseY = std::min(frame.MotionSubrectBaseY, motionDesc.Height);
-    const unsigned int wantedMotionWidth = frame.MotionVectorsLowResolution ? guideWidth : width;
-    const unsigned int wantedMotionHeight = frame.MotionVectorsLowResolution ? guideHeight : height;
+
+    // Nếu vector là High-Res (display resolution), dùng kích thước gốc của motionDesc
+    const unsigned int fullMotionWidth = (unsigned int) motionDesc.Width;
+    const unsigned int fullMotionHeight = motionDesc.Height;
+    const unsigned int wantedMotionWidth = frame.MotionVectorsLowResolution ? guideWidth : fullMotionWidth;
+    const unsigned int wantedMotionHeight = frame.MotionVectorsLowResolution ? guideHeight : fullMotionHeight;
+
     const unsigned int motionWidth =
         std::min(wantedMotionWidth, (unsigned int) motionDesc.Width - motionBaseX);
     const unsigned int motionHeight = std::min(wantedMotionHeight, motionDesc.Height - motionBaseY);
@@ -1778,9 +1783,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         return;
     }
 
-    // Motion Vector independent axes scaling
-    const float mvToWorkX = width != 0 ? (float) workWidth / (float) width : 1.0f;
-    const float mvToWorkY = height != 0 ? (float) workHeight / (float) height : 1.0f;
+    // FIX CHO PRE-SR: Tự động chia tỉ lệ vector theo đúng nguồn gốc xuất phát của nó (Render hay Display)
+    const float mvRefWidth = (float)(frame.MotionVectorsLowResolution ? width : motionDesc.Width);
+    const float mvRefHeight = (float)(frame.MotionVectorsLowResolution ? height : motionDesc.Height);
+
+    const float mvToWorkX = mvRefWidth != 0.0f ? (float) workWidth / mvRefWidth : 1.0f;
+    const float mvToWorkY = mvRefHeight != 0.0f ? (float) workHeight / mvRefHeight : 1.0f;
 
     SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
 

@@ -1992,9 +1992,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     }
     else
     {
-        // FIX CHÍNH: Khi kéo quá 100 hoặc có lỗi frame, CHỈ BỎ QUA FRAME ĐÓ và RESET, KHÔNG KHÓA CHẾT TÍNH NĂNG
-        LOG_WARN("DLSS-NR evaluate returned 0x{:X} ({}), skipping this frame without disabling", (uint32_t) result,
-                 NgxResultName((unsigned int) result));
+        static unsigned long long lastWarnFrame = 0;
+        if (g_frames - lastWarnFrame > 300)
+        {
+            lastWarnFrame = g_frames;
+            LOG_WARN("DLSS-NR evaluate returned 0x{:X} ({}), skipping frame (throttled warning)", 
+                     (uint32_t) result, NgxResultName((unsigned int) result));
+        }
+
         g_nr.reset = true;
 
         MakeModelWritable(g_nr.output);

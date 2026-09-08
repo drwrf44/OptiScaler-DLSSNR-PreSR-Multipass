@@ -1161,12 +1161,20 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     const unsigned int fullMotionWidth = (unsigned int) motionDesc.Width;
     const unsigned int fullMotionHeight = motionDesc.Height;
 
-    unsigned int wantedMotionWidth = frame.MotionVectorsLowResolution
-        ? ((frame.RenderSubrectWidth != 0) ? frame.RenderSubrectWidth : guideWidth)
-        : width;
-    unsigned int wantedMotionHeight = frame.MotionVectorsLowResolution
-        ? ((frame.RenderSubrectHeight != 0) ? frame.RenderSubrectHeight : guideHeight)
-        : height;
+    unsigned int wantedMotionWidth = fullMotionWidth;
+    unsigned int wantedMotionHeight = fullMotionHeight;
+
+    if (frame.MotionVectorsLowResolution)
+    {
+        wantedMotionWidth = (frame.RenderSubrectWidth != 0) ? frame.RenderSubrectWidth : guideWidth;
+        wantedMotionHeight = (frame.RenderSubrectHeight != 0) ? frame.RenderSubrectHeight : guideHeight;
+    }
+    else if (!frame.BeforeUpscale)
+    {
+        wantedMotionWidth = width;
+        wantedMotionHeight = height;
+    }
+
     wantedMotionWidth = std::min(wantedMotionWidth, fullMotionWidth);
     wantedMotionHeight = std::min(wantedMotionHeight, fullMotionHeight);
 
@@ -1790,12 +1798,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     }
 
     // Motion vector reference space resolution calculation (works accurately for both Pre-SR and Post-SR)
-    float mvSourceWidth = frame.MotionVectorsLowResolution
-        ? ((frame.RenderSubrectWidth > 0) ? (float) frame.RenderSubrectWidth : (float) wantedMotionWidth)
-        : (float) width;
-    float mvSourceHeight = frame.MotionVectorsLowResolution
-        ? ((frame.RenderSubrectHeight > 0) ? (float) frame.RenderSubrectHeight : (float) wantedMotionHeight)
-        : (float) height;
+    float mvSourceWidth = (float) wantedMotionWidth;
+    float mvSourceHeight = (float) wantedMotionHeight;
 
     const float mvToWorkX = (mvSourceWidth > 0.0f) ? ((float) workWidth / mvSourceWidth) : 1.0f;
     const float mvToWorkY = (mvSourceHeight > 0.0f) ? ((float) workHeight / mvSourceHeight) : 1.0f;

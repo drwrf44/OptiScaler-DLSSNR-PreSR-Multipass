@@ -1226,6 +1226,11 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                                                   : cfg.DlssNrWorkingScale.value_or_default();
     if (!std::isfinite(workScale))
         workScale = frame.AfterRayReconstruction ? 0.5f : 1.0f;
+
+    // ULTRA QUALITY PRE-SR: Tự động kích hoạt Supersampling 1.25x khi bật Pre-SR để tăng mật độ chi tiết cạnh
+    if (frame.BeforeUpscale && workScale <= 1.0f)
+        workScale = 1.25f;
+
     workScale = workScale < 0.25f ? 0.25f : (workScale > 2.0f ? 2.0f : workScale);
     const auto workWidth = (unsigned int) (width * workScale + 0.5f);
     const auto workHeight = (unsigned int) (height * workScale + 0.5f);
@@ -1321,7 +1326,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             LOG_ERROR("DLSS-NR: could not allocate the model-output ping-pong; extra passes are disabled");
     }
 
-    if (reduced && g_nr.colorSmall != nullptr)
+    if (reduced && g_nr.colorSmall == nullptr)
         g_nr.colorSmall = CreateScratch(device, desc.Format, workWidth, workHeight);
 
     if (workScale > 1.0f && g_nr.outputNative == nullptr)
@@ -1379,16 +1384,17 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
         const auto tuning = PassTuning(cfg, 0);
 
-        // NÂNG CẤP CHẤT LƯỢNG KHI TẠO FEATURE PRE-SR:
+        // NÂNG CẤP KỊCH TRẦN CHO FEATURE PRE-SR:
         const float createIntensity = frame.BeforeUpscale ? std::clamp(tuning.intensity * 0.8f, 0.25f, 0.55f) : tuning.intensity;
-        const float createStructure = frame.BeforeUpscale ? std::max(tuning.structure, 0.85f) : tuning.structure;
+        const float createStructure = frame.BeforeUpscale ? 1.0f : tuning.structure;
+        const float createTone = frame.BeforeUpscale ? std::max(tuning.tone, 0.75f) : tuning.tone;
 
         g_nr.feature =
             g_nr.create(snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
                         device, cmdList, g_nr.capabilityParams, workWidth, workHeight,
                         (int) PassPreset(cfg, 0),
                         createIntensity, (int) PassStyle(cfg, 0),
-                        createStructure, tuning.tone, tuning.skin,
+                        createStructure, createTone, tuning.skin,
                         tuning.autoMask ? 1 : 0, 1);
 
         if (g_nr.feature == nullptr)
@@ -1490,14 +1496,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
                 SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
                 const auto tuning = PassTuning(cfg, pass);
                 const float passCreateIntensity = frame.BeforeUpscale ? std::clamp(tuning.intensity * 0.8f, 0.25f, 0.55f) : tuning.intensity;
-                const float passCreateStructure = frame.BeforeUpscale ? std::max(tuning.structure, 0.85f) : tuning.structure;
+                const float passCreateStructure = frame.BeforeUpscale ? 1.0f : tuning.structure;
+                const float passCreateTone = frame.BeforeUpscale ? std::max(tuning.tone, 0.75f) : tuning.tone;
 
                 g_nr.passFeature[pass] = g_nr.create(
                     snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
                     device, cmdList, g_nr.capabilityParams, workWidth, workHeight,
                     (int) PassPreset(cfg, pass), passCreateIntensity,
                     (int) PassStyle(cfg, pass),
-                    passCreateStructure, tuning.tone, tuning.skin,
+                    passCreateStructure, passCreateTone, tuning.skin,
                     tuning.autoMask ? 1 : 0, 1);
 
                 if (g_nr.passFeature[pass] != nullptr)
@@ -1884,13 +1891,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         const bool passReset = g_nr.reset || (pass > 0 && g_nr.passNeedsReset[pass]);
         const auto tuning = PassTuning(cfg, pass);
 
-        // NÂNG CẤP ĐỘ NÉT VÀ KHỬ BÓNG MA CHO PRE-SR:
+        // NÂNG CẤP CHẤT LƯỢNG KỊCH TRẦN CHO PRE-SR EVALUATE:
         const float passIntensity = frame.BeforeUpscale
             ? std::clamp(tuning.intensity * 0.8f, 0.25f, 0.55f)
             : tuning.intensity;
-        const float passStructure = frame.BeforeUpscale
-            ? std::max(tuning.structure, 0.85f)
-            : tuning.structure;
+        const float passStructure = frame.BeforeUpscale ? 1.0f : tuning.structure;
+        const float passTone = frame.BeforeUpscale ? std::max(tuning.tone, 0.75f) : tuning.tone;
 
         MakeModelWritable(passOutput);
         result = g_nr.evaluate(
@@ -1899,7 +1905,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             depthBaseY, motionBaseX, motionBaseY, g_nr.guideDepthInverted ? 1 : 0,
             passReset ? 1 : 0, passIntensity,
             (int) PassStyle(cfg, pass), passStructure,
-            tuning.tone, tuning.skin,
+            passTone, tuning.skin,
             tuning.autoMask ? 1 : 0, g_nr.guideMvScaleX * mvToWorkX,
             g_nr.guideMvScaleY * mvToWorkY);
 
@@ -1986,10 +1992,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.Width = width;
         resolveParams.Height = height;
 
-        // Tự động giữ lại 85% - 100% chi tiết cho Pre-SR để tăng tối đa độ nét
-        resolveParams.TransferStrength = frame.BeforeUpscale
-            ? std::max(cfg.DlssNrTransferStrength.value_or_default(), 0.85f)
-            : cfg.DlssNrTransferStrength.value_or_default();
+        // TRUYỀN DẪN 100% CHI TIẾT TỐI ĐA CHO PRE-SR:
+        resolveParams.TransferStrength = frame.BeforeUpscale ? 1.0f : cfg.DlssNrTransferStrength.value_or_default();
 
         const auto strength = [](float v) { return std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 1.0f; };
         resolveParams.SkinProtection = cfg.DlssNrSkinProtection.value_or_default();

@@ -481,7 +481,7 @@ struct NrRetired
 {
     void* feature = nullptr;
     ID3D12Resource* resource = nullptr;
-    int framesLeft = 32;
+    int framesLeft = 8;
 };
 
 std::vector<NrRetired> g_nrRetired;
@@ -1149,7 +1149,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         guideHeight = subH;
     }
 
-    // Motion vector and guide subrect clamping
+    
     const unsigned int depthBaseX = std::min(frame.DepthSubrectBaseX, (unsigned int) guideDesc.Width);
     const unsigned int depthBaseY = std::min(frame.DepthSubrectBaseY, guideDesc.Height);
     guideWidth = std::min(guideWidth, (unsigned int) guideDesc.Width - depthBaseX);
@@ -1160,28 +1160,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     const unsigned int fullMotionWidth = (unsigned int) motionDesc.Width;
     const unsigned int fullMotionHeight = motionDesc.Height;
-
-    unsigned int wantedMotionWidth = fullMotionWidth;
-    unsigned int wantedMotionHeight = fullMotionHeight;
-
-    if (frame.MotionVectorsLowResolution)
-    {
-        wantedMotionWidth = (frame.RenderSubrectWidth != 0) ? frame.RenderSubrectWidth : guideWidth;
-        wantedMotionHeight = (frame.RenderSubrectHeight != 0) ? frame.RenderSubrectHeight : guideHeight;
-    }
-    else if (!frame.BeforeUpscale)
-    {
-        wantedMotionWidth = width;
-        wantedMotionHeight = height;
-    }
-
-    wantedMotionWidth = std::min(wantedMotionWidth, fullMotionWidth);
-    wantedMotionHeight = std::min(wantedMotionHeight, fullMotionHeight);
+    const unsigned int wantedMotionWidth = frame.MotionVectorsLowResolution ? guideWidth : fullMotionWidth;
+    const unsigned int wantedMotionHeight = frame.MotionVectorsLowResolution ? guideHeight : fullMotionHeight;
 
     const unsigned int motionWidth =
         std::min(wantedMotionWidth, (unsigned int) motionDesc.Width - motionBaseX);
-    const unsigned int motionHeight =
-        std::min(wantedMotionHeight, motionDesc.Height - motionBaseY);
+    const unsigned int motionHeight = std::min(wantedMotionHeight, motionDesc.Height - motionBaseY);
 
     g_nr.guideWidth = guideWidth;
     g_nr.guideHeight = guideHeight;
@@ -1797,12 +1781,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         return;
     }
 
-    // Motion vector reference space resolution calculation (works accurately for both Pre-SR and Post-SR)
-    float mvSourceWidth = (float) wantedMotionWidth;
-    float mvSourceHeight = (float) wantedMotionHeight;
+    
+    const float mvRefWidth = (float)(frame.MotionVectorsLowResolution ? width : motionDesc.Width);
+    const float mvRefHeight = (float)(frame.MotionVectorsLowResolution ? height : motionDesc.Height);
 
-    const float mvToWorkX = (mvSourceWidth > 0.0f) ? ((float) workWidth / mvSourceWidth) : 1.0f;
-    const float mvToWorkY = (mvSourceHeight > 0.0f) ? ((float) workHeight / mvSourceHeight) : 1.0f;
+    const float mvToWorkX = mvRefWidth > 0.0f ? (float) workWidth / mvRefWidth : 1.0f;
+    const float mvToWorkY = mvRefHeight > 0.0f ? (float) workHeight / mvRefHeight : 1.0f;
 
     SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
 
@@ -1818,9 +1802,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         if (proxyResult != 1)
         {
-            g_nr.failed = true;
-            g_nr.reason = "the proxy path could not run the model";
-            LOG_ERROR("DLSS-NR (proxy): evaluate returned 0x{:X} ({}), disabling for this session",
+            LOG_ERROR("DLSS-NR (proxy): evaluate returned 0x{:X} ({})",
                       proxyResult, NgxResultName(proxyResult));
         }
 
@@ -2115,15 +2097,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     }
     else
     {
-        g_nr.failed = true;
-        g_nr.reason = "the model refused to run";
-        LOG_ERROR("DLSS-NR evaluate returned 0x{:X} ({}), disabling for this session", (uint32_t) result,
-                  NgxResultName((unsigned int) result));
+        LOG_WARN("DLSS-NR evaluate returned 0x{:X} ({}), skipping this frame without disabling", (uint32_t) result,
+                 NgxResultName((unsigned int) result));
+        g_nr.reset = true;
 
-        MakeModelWritable(g_nr.output);
-        if (g_nr.passScratch != nullptr)
-            MakeModelWritable(g_nr.passScratch);
-    }
+    MakeModelWritable(g_nr.output);
+    if (g_nr.passScratch != nullptr)
+        MakeModelWritable(g_nr.passScratch);
 
     Barrier(cmdList, g_nr.hdrCopy, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);

@@ -1159,7 +1159,6 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     const unsigned int motionBaseX = std::min(frame.MotionSubrectBaseX, (unsigned int) motionDesc.Width);
     const unsigned int motionBaseY = std::min(frame.MotionSubrectBaseY, motionDesc.Height);
 
-    // Nếu vector là High-Res (display resolution), dùng kích thước gốc của motionDesc
     const unsigned int fullMotionWidth = (unsigned int) motionDesc.Width;
     const unsigned int fullMotionHeight = motionDesc.Height;
     const unsigned int wantedMotionWidth = frame.MotionVectorsLowResolution ? guideWidth : fullMotionWidth;
@@ -1322,7 +1321,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             LOG_ERROR("DLSS-NR: could not allocate the model-output ping-pong; extra passes are disabled");
     }
 
-    if (reduced && g_nr.colorSmall == nullptr)
+    if (reduced && g_nr.colorSmall != nullptr)
         g_nr.colorSmall = CreateScratch(device, desc.Format, workWidth, workHeight);
 
     if (workScale > 1.0f && g_nr.outputNative == nullptr)
@@ -1379,11 +1378,13 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
         SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
         const auto tuning = PassTuning(cfg, 0);
+        // Tối ưu hóa Intensity khi tạo feature cho Pre-SR để chống bệt
+        const float createIntensity = frame.BeforeUpscale ? std::clamp(tuning.intensity * 0.7f, 0.15f, 0.45f) : tuning.intensity;
         g_nr.feature =
             g_nr.create(snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
                         device, cmdList, g_nr.capabilityParams, workWidth, workHeight,
                         (int) PassPreset(cfg, 0),
-                        tuning.intensity, (int) PassStyle(cfg, 0),
+                        createIntensity, (int) PassStyle(cfg, 0),
                         tuning.structure, tuning.tone, tuning.skin,
                         tuning.autoMask ? 1 : 0, 1);
 
@@ -1485,10 +1486,11 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             {
                 SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
                 const auto tuning = PassTuning(cfg, pass);
+                const float passCreateIntensity = frame.BeforeUpscale ? std::clamp(tuning.intensity * 0.7f, 0.15f, 0.45f) : tuning.intensity;
                 g_nr.passFeature[pass] = g_nr.create(
                     snippet->wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(),
                     device, cmdList, g_nr.capabilityParams, workWidth, workHeight,
-                    (int) PassPreset(cfg, pass), tuning.intensity,
+                    (int) PassPreset(cfg, pass), passCreateIntensity,
                     (int) PassStyle(cfg, pass),
                     tuning.structure, tuning.tone, tuning.skin,
                     tuning.autoMask ? 1 : 0, 1);
@@ -1878,12 +1880,18 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         const bool passReset = g_nr.reset || (pass > 0 && g_nr.passNeedsReset[pass]);
         const auto tuning = PassTuning(cfg, pass);
 
+        // THUẬT TOÁN CHỐNG NHÒE KÉP (ANTI-SMEAR):
+        // Khi chạy Pre-SR, tự động điều tiết intensity để triệt tiêu việc lưu bóng ma chồng lấn với DLSS SR
+        const float passIntensity = frame.BeforeUpscale
+            ? std::clamp(tuning.intensity * 0.7f, 0.15f, 0.45f)
+            : tuning.intensity;
+
         MakeModelWritable(passOutput);
         result = g_nr.evaluate(
             cmdList, passFeature, g_nr.capabilityParams, passInput, depthIn, motionIn, passOutput,
             workWidth, workHeight, guideWidth, guideHeight, motionWidth, motionHeight, depthBaseX,
             depthBaseY, motionBaseX, motionBaseY, g_nr.guideDepthInverted ? 1 : 0,
-            passReset ? 1 : 0, tuning.intensity,
+            passReset ? 1 : 0, passIntensity,
             (int) PassStyle(cfg, pass), tuning.structure,
             tuning.tone, tuning.skin,
             tuning.autoMask ? 1 : 0, g_nr.guideMvScaleX * mvToWorkX,
@@ -1982,7 +1990,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         resolveParams.ColourStrength = cfg.DlssNrColourStrength.value_or_default();
         resolveParams.DebugView = cfg.DlssNrDebugView.value_or_default();
         resolveParams.MaxRatio = cfg.DlssNrMaxRatio.value_or_default();
-        resolveParams.Transfer = cfg.DlssNrTransfer.value_or_default();
+        // Tự động kích hoạt Matched Residual (1) cho Pre-SR để không làm bệt khung hình
+        resolveParams.Transfer = frame.BeforeUpscale ? 1u : cfg.DlssNrTransfer.value_or_default();
         resolveParams.DebugScale = cfg.DlssNrWhitePointScale.value_or_default();
         resolveParams.Passthrough = isHdrBuffer ? 0u : 1u;
         resolveParams.ReversibleMode = cfg.DlssNrReversibleMode.value_or_default();

@@ -31,7 +31,9 @@ using PFN_VkProbe = int(__cdecl*)(const wchar_t*);
 using PFN_VkInit = int(__cdecl*)(const wchar_t*, const wchar_t*, void*, void*, void*, int);
 using PFN_VkCreate = void*(__cdecl*)(void*, void*, unsigned int, unsigned int, int, float, int, float, float, float,
                                      int, int);
+// Updated to 27 parameters to support independent Motion Vector / Depth subrects (Motion Vector Fix)
 using PFN_VkEvaluate = int(__cdecl*)(void*, void*, void*, void*, void*, void*, void*, unsigned int, unsigned int,
+                                     unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int,
                                      unsigned int, unsigned int, int, int, float, int, float, float, float, int, float,
                                      float);
 using PFN_VkRelease = void(__cdecl*)(void*);
@@ -140,16 +142,9 @@ struct VkState
     unsigned long long meterFrames = 0;
 };
 
-// The grid the meter writes, and the size of one readback. 8 * 8 * sizeof(float).
 constexpr uint32_t kMeterSide = 8;
 constexpr VkDeviceSize kMeterBytes = kMeterSide * kMeterSide * sizeof(float);
-
-// Four, so the slot being read is four frames behind the slot being written and the read never waits
-// on the GPU. Same depth as the D3D12 meter's ring, for the same reason.
 constexpr unsigned long long kMeterSlots = 4;
-
-// Four frames of pairs. Three would do, four keeps the modulo cheap and the slot being written well
-// clear of the slot being read.
 constexpr uint32_t kTimingSlots = 4;
 
 VkState g_vk;
@@ -164,10 +159,6 @@ void Fail(const char* why)
     g_vk.reason = why;
     LOG_ERROR("DLSS-NR Vulkan unavailable: {}", why);
 }
-
-// ---------------------------------------------------------------------------------------------
-// Images this pass owns
-// ---------------------------------------------------------------------------------------------
 
 void DestroyImage(OwnedImage& img)
 {
@@ -200,10 +191,6 @@ uint32_t FindMemoryTypeIndex(uint32_t typeBits, VkMemoryPropertyFlags properties
     return UINT32_MAX;
 }
 
-// STORAGE and SAMPLED both, because every one of these is written by one dispatch and read by the
-// next; TRANSFER_SRC so a capture can copy it out without a second surface.
-// Build the OS_Vk resample descriptor for one of our own images. OS_Vk reads Width/Height/Format from
-// this (the NR override makes it size from the images, not the current feature).
 static VkImageInfo ImageInfoOf(const OwnedImage& img)
 {
     VkImageInfo info {};
@@ -276,7 +263,6 @@ bool CreateImage(OwnedImage& img, uint32_t width, uint32_t height, VkFormat form
     img.format = format;
     img.layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    // The NGX wrapper. Filled once, because none of it changes until the image is recreated.
     img.ngx.Type = NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW;
     img.ngx.Resource.ImageViewInfo.ImageView = img.view;
     img.ngx.Resource.ImageViewInfo.Image = img.image;
@@ -289,9 +275,6 @@ bool CreateImage(OwnedImage& img, uint32_t width, uint32_t height, VkFormat form
     return true;
 }
 
-// The ring of host-visible buffers the meter's grid is copied into, created once and mapped for
-// good. HOST_COHERENT so the read needs no invalidate; it is universally available for a buffer this
-// small and the alternative is a vkInvalidateMappedMemoryRanges on a path that runs every frame.
 bool CreateMeterReadback()
 {
     for (unsigned long long i = 0; i < kMeterSlots; ++i)
@@ -357,9 +340,6 @@ void DestroyMeterReadback()
     g_vk.meterFrames = 0;
 }
 
-// A layout transition with the access masks that go with it. Vulkan has no equivalent of D3D12's
-// state promotion, so every read and every write says which layout it needs and this is how it gets
-// there. Tracked per image so a no-op transition is not recorded.
 void Transition(VkCommandBuffer cmd, OwnedImage& img, VkImageLayout to)
 {
     if (img.image == VK_NULL_HANDLE || img.layout == to)
@@ -392,8 +372,6 @@ void Transition(VkCommandBuffer cmd, OwnedImage& img, VkImageLayout to)
     img.layout = to;
 }
 
-// A resource the game owns. Its layout is the game's business, so this records the transition and
-// puts it back exactly as it was rather than tracking it.
 void TransitionForeign(VkCommandBuffer cmd, VkImage image, VkImageSubresourceRange range, VkImageLayout from,
                        VkImageLayout to)
 {
@@ -414,10 +392,6 @@ void TransitionForeign(VkCommandBuffer cmd, VkImage image, VkImageSubresourceRan
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
                          nullptr, 1, &barrier);
 }
-
-// ---------------------------------------------------------------------------------------------
-// Bring-up
-// ---------------------------------------------------------------------------------------------
 
 bool LoadForwarder()
 {
@@ -458,9 +432,6 @@ bool LoadForwarder()
     return true;
 }
 
-// Whether a format can hold linear, open-ended light. A frame the game already tone mapped has white
-// at 1 and must not be encoded a second time; an 8-bit or normalised format cannot be scene-referred
-// whatever the game says. The D3D12 path asks the same question of DXGI formats.
 bool FormatCanHoldLinearHdr(VkFormat format)
 {
     switch (format)
@@ -477,9 +448,6 @@ bool FormatCanHoldLinearHdr(VkFormat format)
     }
 }
 
-// The create flags the game gave its own upscaler, which is where HDR and inverted depth are stated.
-// Read from the parameter block rather than configured, because they describe the game's buffers and
-// getting either wrong is silent: an encoded frame encoded twice, or depth read backwards.
 unsigned int GameCreateFlags(NVSDK_NGX_Parameter* params)
 {
     unsigned int flags = 0;
@@ -502,16 +470,10 @@ std::optional<std::filesystem::path> FindSnippet()
 
 } // namespace
 
-// ---------------------------------------------------------------------------------------------
-
 bool IsRunningVk() { return g_vk.feature != nullptr && !g_vk.failed; }
-
 const char* FailureReasonVk() { return g_vk.failed ? g_vk.reason : ""; }
-
 unsigned long long FramesVk() { return g_vk.frames; }
-
 bool ExposureOfferedVk() { return g_vk.exposureOffered; }
-
 std::optional<double> LastGpuTimeVk() { return g_vk.lastGpuTime; }
 
 static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* params, VkInstance instance,
@@ -548,8 +510,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     if (g_vk.failed)
         return;
 
-    // The game's own resources, already wrapped: NGX hands Vulkan resources over as
-    // NVSDK_NGX_Resource_VK, so only this pass's own images need building.
     NVSDK_NGX_Resource_VK* colour = nullptr;
     NVSDK_NGX_Resource_VK* depth = nullptr;
     NVSDK_NGX_Resource_VK* motion = nullptr;
@@ -558,20 +518,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     params->Get(NVSDK_NGX_Parameter_Depth, (void**) &depth);
     params->Get(NVSDK_NGX_Parameter_MotionVectors, (void**) &motion);
 
-    // The game's exposure, now read rather than only counted.
-    //
-    // What blocked this was the layout: a descriptor names the layout its image will be in when the
-    // shader runs, NVIDIA's Vulkan header does not use the word "layout" once, and a barrier is no
-    // safer because it needs the layout it is coming from. Three things in this tree answer it, and
-    // they agree. FSR2Feature_Vk hands this same texture to FidelityFX as COMPUTE_READ, which its
-    // Vulkan backend maps to SHADER_READ_ONLY_OPTIMAL, on a path that works in these games. The
-    // D3D12-on-Vulkan bridge transitions the game's exposure image out of SHADER_READ_ONLY_OPTIMAL,
-    // on a path that works. And the header stating nothing means there is no contract to break --
-    // the convention is the contract.
-    //
-    // So it is bound in SHADER_READ_ONLY_OPTIMAL and no barrier is recorded: this never transitions a
-    // resource it does not own. If a game turns out to leave it somewhere else the cost is a wrong
-    // number, not a lost device, and the gate on the readback throws a wrong number away.
     NVSDK_NGX_Resource_VK* exposure = nullptr;
     float preExposure = 1.0f;
     const bool havePre =
@@ -580,7 +526,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     params->Get(NVSDK_NGX_Parameter_ExposureTexture, (void**) &exposure);
 
     static bool saidExposure = false;
-
     if (!saidExposure)
     {
         saidExposure = true;
@@ -594,8 +539,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     if (havePre && std::isfinite(preExposure) && preExposure > 0.0f)
         g_vk.gamePreExposure = preExposure;
 
-    // Take the grid written four frames ago. Retired by now, so this reads mapped memory rather than
-    // waiting on the GPU -- which is the whole reason for the ring.
     if (g_vk.meterFrames >= kMeterSlots)
     {
         const void* mapped = g_vk.meterMapped[g_vk.meterFrames % kMeterSlots];
@@ -605,18 +548,12 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
             float measured = 0.0f;
             std::memcpy(&measured, mapped, sizeof(float));
 
-            // Believed only if it could be an exposure. A texel read through a layout the game did
-            // not leave it in, or a slot the game stopped filling, fails here and the last good
-            // value stands.
             if (std::isfinite(measured) && measured > 0.0f)
                 g_vk.gameExposure = measured;
         }
     }
 
-    // Said when it moves by more than a fiftieth, not every frame. Enough to see in a log that the
-    // number is the game's and that it tracks the scene, without a line per frame.
     static float loggedExposure = -1.0f;
-
     if (g_vk.gameExposure > 1e-6f &&
         std::abs(loggedExposure - g_vk.gameExposure) > std::max(0.02f * g_vk.gameExposure, 1e-5f))
     {
@@ -628,14 +565,12 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     if (colour == nullptr || depth == nullptr || motion == nullptr)
     {
         static bool said = false;
-
         if (!said)
         {
             said = true;
             LOG_INFO("DLSS-NR Vulkan: the parameter block carried no {}",
                      colour == nullptr ? "output" : (depth == nullptr ? "depth" : "motion vectors"));
         }
-
         return;
     }
 
@@ -649,6 +584,11 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
 
     uint32_t width = colour->Resource.ImageViewInfo.Width;
     uint32_t height = colour->Resource.ImageViewInfo.Height;
+    uint32_t guideWidth = depth->Resource.ImageViewInfo.Width;
+    uint32_t guideHeight = depth->Resource.ImageViewInfo.Height;
+    const uint32_t motionAllocationWidth = motion->Resource.ImageViewInfo.Width;
+    const uint32_t motionAllocationHeight = motion->Resource.ImageViewInfo.Height;
+
     uint32_t renderWidth = 0, renderHeight = 0, baseX = 0, baseY = 0;
     params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &renderWidth);
     params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &renderHeight);
@@ -656,32 +596,53 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     {
         params->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X, &baseX);
         params->Get(NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y, &baseY);
-        // Origin-zero padded inputs are common with dynamic resolution. Never use a preset table.
         if (baseX || baseY || ((renderWidth == 0) != (renderHeight == 0)) ||
             renderWidth > width || renderHeight > height)
-            return; // caller falls back to post-SR, without editing the input
+            return;
         if (renderWidth && renderHeight)
         {
             width = renderWidth;
             height = renderHeight;
         }
     }
-    const uint32_t guideWidth = renderWidth ? renderWidth : depth->Resource.ImageViewInfo.Width;
-    const uint32_t guideHeight = renderHeight ? renderHeight : depth->Resource.ImageViewInfo.Height;
-    if (!guideWidth || !guideHeight || guideWidth > depth->Resource.ImageViewInfo.Width ||
-        guideHeight > depth->Resource.ImageViewInfo.Height || guideWidth > motion->Resource.ImageViewInfo.Width ||
-        guideHeight > motion->Resource.ImageViewInfo.Height)
-        return;
 
     if (width == 0 || height == 0)
         return;
     if (handled)
-        *handled = true; // includes warm-up: do not recreate post-SR resources in this command buffer
+        *handled = true;
 
-    // The model's working size. The slider is a fraction of the frame; at 1 it is the frame, and the
-    // reduced path below never runs, so the default is byte-for-byte what it was.
-    // Above 1 the model supersamples (up to 2x): the proxy is enlarged, the model runs above native,
-    // and superDown averages the answer back. Vulkan matches the D3D12 cap.
+    // --- MOTION VECTOR & SUBRECT FIX APPLIED HERE ---
+    const unsigned int createFlags = GameCreateFlags(params);
+    const bool gameSaysHdr = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0;
+    const bool depthInverted = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
+    const bool lowResolutionMotion = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) != 0;
+
+    uint32_t depthBaseX = 0, depthBaseY = 0, motionBaseX = 0, motionBaseY = 0;
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X, &depthBaseX);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y, &depthBaseY);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X, &motionBaseX);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y, &motionBaseY);
+
+    depthBaseX = std::min(depthBaseX, guideWidth);
+    depthBaseY = std::min(depthBaseY, guideHeight);
+    guideWidth = std::min(renderWidth ? renderWidth : guideWidth, guideWidth - depthBaseX);
+    guideHeight = std::min(renderHeight ? renderHeight : guideHeight, guideHeight - depthBaseY);
+    motionBaseX = std::min(motionBaseX, motionAllocationWidth);
+    motionBaseY = std::min(motionBaseY, motionAllocationHeight);
+    const uint32_t motionWidth = std::min(lowResolutionMotion ? (renderWidth ? renderWidth : width) : width,
+                                          motionAllocationWidth - motionBaseX);
+    const uint32_t motionHeight = std::min(lowResolutionMotion ? (renderHeight ? renderHeight : height) : height,
+                                           motionAllocationHeight - motionBaseY);
+
+    float mvScaleX = 1.0f, mvScaleY = 1.0f;
+    params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &mvScaleX);
+    params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &mvScaleY);
+
+    if (!guideWidth || !guideHeight || guideWidth > depth->Resource.ImageViewInfo.Width ||
+        guideHeight > depth->Resource.ImageViewInfo.Height || motionWidth > motion->Resource.ImageViewInfo.Width ||
+        motionHeight > motion->Resource.ImageViewInfo.Height)
+        return;
+
     float workScale = forcePost ? cfg.DlssNrRRWorkingScale.value_or_default()
                                : cfg.DlssNrWorkingScale.value_or_default();
     workScale = std::isfinite(workScale) ? std::clamp(workScale, 0.25f, 2.0f) : 1.0f;
@@ -696,9 +657,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     g_vk.instance = instance;
     g_vk.physicalDevice = physicalDevice;
 
-    // A device change invalidates everything. The OLD device is presumed dead here -- the game
-    // destroyed it, which already freed every resource made on it -- so abandon those handles rather
-    // than call vkDestroy*/wait-idle on a dead device (that would be use-after-free). Rebuild fresh.
     if (g_vk.device != device)
     {
         ShutdownVk(false);
@@ -710,12 +668,8 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     if (!LoadForwarder())
         return;
 
-    // Initialise NGX on this device, once. The snippet path is the model itself; the forwarder loads
-    // it so the caller gate sees a module named nvngx.dll.
     if (g_vk.creationPending)
     {
-        // A second NGX evaluate need not mean the previous command buffer was submitted.
-        // Poll the GPU marker without waiting; repeated calls during warm-up stay clean.
         if (vkGetEventStatus(device, g_vk.creationReady) != VK_EVENT_SET)
             return;
         g_vk.creationPending = false;
@@ -724,7 +678,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     if (!g_vk.ngxInitialised)
     {
         auto snippet = FindSnippet();
-
         if (!snippet.has_value())
         {
             Fail("nvngx_dlssnr.dll was not found beside OptiScaler or the game");
@@ -732,9 +685,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         }
 
         const int probe = g_vk.probe != nullptr ? g_vk.probe(snippet->wstring().c_str()) : 0;
-
-        // Four bits, one per entry point. Anything short of fifteen means the model's Vulkan surface
-        // is not entirely reachable and there is no point going further.
         if (probe != 15)
         {
             LOG_ERROR("DLSS-NR Vulkan: the model's Vulkan surface is incomplete (probe {})", probe);
@@ -771,10 +721,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     {
         VkPhysicalDeviceProperties props {};
         vkGetPhysicalDeviceProperties(physicalDevice, &props);
-
-        // A period of zero means the device does not support timestamps on this queue. The pass runs
-        // regardless; it simply reports no cost, which is what the D3D12 path does when its heap is
-        // unavailable.
         g_vk.timestampPeriod = props.limits.timestampPeriod;
 
         if (g_vk.timestampPeriod > 0.0f)
@@ -795,7 +741,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     if (g_vk.pass == nullptr)
     {
         g_vk.pass = std::make_unique<DlssNr_Vk>("Neural Rendering", device, physicalDevice);
-
         if (!g_vk.pass->IsInit())
         {
             g_vk.pass.reset();
@@ -804,23 +749,15 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         }
     }
 
-    // Resize. The feature is built for a size and has to be rebuilt when the frame OR the working
-    // size changes -- moving the slider is a rebuild, which is why it is compared here.
     bool profileChanged = g_vk.activePasses != passes;
     for (unsigned int pass = 0; pass < passes; ++pass)
         profileChanged |= g_vk.builtTuning[pass] != Profiles::PassTuning(cfg, pass) ||
                           g_vk.builtPreset[pass] != Profiles::PassPreset(cfg, pass) ||
                           g_vk.builtStyle[pass] != Profiles::PassStyle(cfg, pass);
+
     if (g_vk.width != width || g_vk.height != height || g_vk.workWidth != workWidth ||
         g_vk.workHeight != workHeight || g_vk.beforeSr != beforeSr || profileChanged)
     {
-        // This block releases the feature and frees the surfaces below IMMEDIATELY. A frame-size
-        // change is already fenced by the game -- it recreates the swapchain around it -- but moving
-        // the working-scale slider is not: the game is mid-flight and previous frames' command
-        // buffers still reference the feature and images about to be destroyed. Freeing a Vulkan
-        // resource that in-flight GPU work still touches is device removal (ERR_GFX_STATE, reproduced
-        // on RDR2 and Enshrouded by dragging the model-resolution slider). Drain the device first.
-        // Only the rare resize path reaches here, so the CPU stall is a one-off hitch, not per-frame.
         if (g_vk.device != VK_NULL_HANDLE)
             vkDeviceWaitIdle(g_vk.device);
 
@@ -838,9 +775,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         DestroyImage(g_vk.scratch);
 
         const VkFormat working = VK_FORMAT_R16G16B16A16_SFLOAT;
-
-        // The meter is a fixed 8x8 whatever the frame is, so it is only built the once -- but it is
-        // built alongside the rest so that a failure here is caught by the same check.
         const bool meterReady = (g_vk.meter.Valid() || CreateImage(g_vk.meter, kMeterSide, kMeterSide,
                                                                    VK_FORMAT_R32_SFLOAT, true)) &&
                                 CreateMeterReadback();
@@ -851,9 +785,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         DestroyImage(g_vk.proxySmall);
         DestroyImage(g_vk.outputNative);
 
-        // output is the model's target, so it is the working size. proxy and keep are full: proxy is
-        // the source the downsample reads, keep is the untouched frame the resolve composites onto.
-        // outputNative is the native buffer the supersample down-leg averages the answer into.
         const bool ok = CreateImage(g_vk.output, workWidth, workHeight, working, true) &&
                         (passes == 1 || CreateImage(g_vk.scratch, workWidth, workHeight, working, true)) &&
                         CreateImage(g_vk.proxy, width, height, working, true) &&
@@ -905,8 +836,7 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         created = true;
         g_vk.reset = true;
     }
-    // NGX creation may record GPU uploads. Do not evaluate until a subsequent submission,
-    // just as on D3D12. Leave this warm-up frame clean instead of evaluating unready weights.
+
     if (created)
     {
         if (g_vk.creationReady == VK_NULL_HANDLE)
@@ -919,51 +849,27 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
             }
         }
         else
-            vkResetEvent(device, g_vk.creationReady); // rebuild above drained previous GPU users
+            vkResetEvent(device, g_vk.creationReady);
         vkCmdSetEvent(cmdBuffer, g_vk.creationReady, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         g_vk.creationPending = true;
         return;
     }
 
-    // -----------------------------------------------------------------------------------------
-    // Encode: the frame the upscaler wrote -> a display-referred proxy, plus an untouched copy
-    // -----------------------------------------------------------------------------------------
-
-    const unsigned int createFlags = GameCreateFlags(params);
-    const bool gameSaysHdr = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) != 0;
-    const bool depthInverted = (createFlags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) != 0;
-
-    // The game asking the upscaler to forget its history -- a cut, a teleport, a load. Same omission
-    // as the D3D12 path had: the model's history was only ever reset by things that happened to us,
-    // never by anything that happened in the game.
+    // Reset detection
     {
         unsigned int gameReset = 0;
-
         if (params->Get(NVSDK_NGX_Parameter_Reset, &gameReset) == NVSDK_NGX_Result_Success &&
             gameReset != 0)
         {
             g_vk.reset = true;
-
             static unsigned long long resets = 0;
             ++resets;
-
             if (resets <= 3 || resets % 100 == 0)
                 LOG_INFO("DLSS-NR Vulkan: the game asked for a history reset ({} so far)", resets);
         }
     }
 
-    // Both have to agree. A game can set the HDR flag on a buffer that cannot hold open-ended light,
-    // and encoding an already tone-mapped frame a second time looks washed out and banded.
     const bool linearHdr = gameSaysHdr && FormatCanHoldLinearHdr(colour->Resource.ImageViewInfo.Format);
-
-    // The same rule as the D3D12 path, deliberately spelled the same way: the game divides its frame
-    // by preExposure and multiplies by exposure, so undoing that is the divisor this pass wants, and
-    // the slider becomes a trim on top rather than the answer.
-    //
-    // The trim is bounded here, at the point of use, rather than at the slider. Someone who found 64
-    // by hand on the manual path and then switches the exposure source on keeps that 64 in their ini;
-    // bounding it in the menu would leave the picture wrong for a reason the menu no longer showed.
-    // Their value stays in the config untouched, so switching back to manual restores it.
     float whitePoint = cfg.DlssNrWhitePointScale.value_or_default();
 
     if (cfg.DlssNrWhitePointSource.value_or_default() == 1 && g_vk.gameExposure > 1e-6f)
@@ -973,7 +879,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     }
 
     static bool saidEncoding = false;
-
     if (!saidEncoding)
     {
         saidEncoding = true;
@@ -1005,30 +910,16 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     encode.GuideWidth = guideWidth;
     encode.GuideHeight = guideHeight;
 
-    const VkImageSubresourceRange colourRange = colour->Resource.ImageViewInfo.SubresourceRange;
-
-    // Open the measurement. Reset immediately before writing: a query pool slot must be reset before
-    // it is written again, and doing it here rather than at the end keeps the two in one place.
     const uint32_t timingSlot = (uint32_t) (g_vk.timedFrames % kTimingSlots);
-
     if (g_vk.queryPool != VK_NULL_HANDLE)
     {
         vkCmdResetQueryPool(cmdBuffer, g_vk.queryPool, timingSlot * 2, 2);
         vkCmdWriteTimestamp(cmdBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_vk.queryPool, timingSlot * 2);
     }
 
-    // The game's colour is read here and written at the end. Its layout on arrival is GENERAL, which
-    // is what NGX requires of a resource it is handed, so it is left alone.
     Transition(cmdBuffer, g_vk.proxy, VK_IMAGE_LAYOUT_GENERAL);
     Transition(cmdBuffer, g_vk.keep, VK_IMAGE_LAYOUT_GENERAL);
 
-    // Read in GENERAL, which is the layout it is actually in.
-    //
-    // This slot used to take the default and declare SHADER_READ_ONLY_OPTIMAL, which disagreed with
-    // the comment four lines up and with the resolve below -- the resolve writes this same image as a
-    // storage image, which is only legal in GENERAL, and nothing transitions it in between. It is the
-    // upscaler's output, a storage image the upscaler has just written, so GENERAL is what it is.
-    // Inert on the only hardware this model runs on, wrong everywhere it is read.
     if (!g_vk.pass->Dispatch(cmdBuffer, encode, width, height, colour->Resource.ImageViewInfo.ImageView,
                              VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, g_vk.proxy.view, g_vk.keep.view,
                              beforeSr ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL))
@@ -1037,28 +928,15 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         return;
     }
 
-    // The model's input: the full proxy, or a downsampled copy of it when the working scale is below
-    // the frame. Mirrors the D3D12 path -- the encode always writes a full proxy, and a separate
-    // downsample makes the small one the model actually reads.
     OwnedImage* modelInput = &g_vk.proxy;
-
     if (reduced && g_vk.proxySmall.Valid())
     {
         bool built = false;
-
         if (workScale > 1.0f)
         {
-            // Supersample: upscale the proxy to the super-native working size with the chosen filter so
-            // the model sees a clean input. Rebuild both scalers when the NR downscaler changed (baked
-            // at construction). proxy -> SHADER_READ_ONLY (sampled), proxySmall -> GENERAL (storage).
             const Scaler wantScaler = cfg.DlssNrScalingDownscaler.value_or_default();
             if (g_vk.nrScaler != wantScaler)
             {
-                // Rebuilding frees the old scalers' pipelines/descriptors. The filter dropdown changes
-                // no size, so this does NOT go through the resize block's drain -- and prior frames'
-                // submitted command buffers still bind these pipelines. Freeing them under in-flight GPU
-                // work is device removal (the same hazard the resize path drains for). Drain first. A
-                // filter change is rare, so the one-off stall is a hitch, not a per-frame cost.
                 if (g_vk.device != VK_NULL_HANDLE)
                     vkDeviceWaitIdle(g_vk.device);
                 g_vk.superUp.reset();
@@ -1113,18 +991,7 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         modelInput = &g_vk.proxySmall;
     }
 
-    // -----------------------------------------------------------------------------------------
-    // The meter: the game's 1x1 exposure -> texel (0,0) of the grid -> a buffer the CPU can read
-    // -----------------------------------------------------------------------------------------
-
-    // The motion slot carries it, because the meter has no use for motion vectors and the shader is
-    // one shader with a fixed set of bindings. The source slot is left empty and gets the dummy.
-    //
-    // Gated on the setting that consumes the answer, which is not merely tidy. This is the only place
-    // the pass binds a resource it does not own on a guess about its layout, and the guess is good
-    // but it is still a guess. A user who has not asked for the exposure source never has the game's
-    // image touched at all, so if some engine does leave it somewhere unexpected, the blast radius is
-    // people who turned the thing on rather than everyone on Vulkan.
+    // Exposure Meter
     if (cfg.DlssNrWhitePointSource.value_or_default() == 1 && exposure != nullptr &&
         exposure->Type == NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGEVIEW &&
         exposure->Resource.ImageViewInfo.ImageView != VK_NULL_HANDLE && g_vk.meter.Valid())
@@ -1158,7 +1025,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
                 vkCmdCopyImageToBuffer(cmdBuffer, g_vk.meter.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                        g_vk.meterReadback[slot], 1, &region);
 
-                // The copy has to be visible to a host read, and only the host will read it.
                 VkBufferMemoryBarrier toHost {};
                 toHost.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
                 toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1177,19 +1043,13 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         }
     }
 
-    // -----------------------------------------------------------------------------------------
-    // The model
-    // -----------------------------------------------------------------------------------------
-
-    float mvX = 1.0f, mvY = 1.0f;
-    params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &mvX);
-    params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &mvY);
-    // Match D3D12: preserve the game's vector encoding, then adjust only for the NR working scale.
-    mvX *= (float) workWidth / width;
-    mvY *= (float) workHeight / height;
+    // --- EVALUATE PASSES WITH MOTION VECTOR FIX ---
+    const float mvToWorkX = width != 0 ? (float) workWidth / (float) width : 1.0f;
+    const float mvToWorkY = height != 0 ? (float) workHeight / (float) height : 1.0f;
     OwnedImage* answer = &g_vk.output;
     OwnedImage* input = modelInput;
     int evaluated = 1;
+
     for (unsigned int pass = 0; pass < passes; ++pass)
     {
         Transition(cmdBuffer, *input, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1198,11 +1058,14 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         evaluated = g_vk.evaluate(
             (void*) cmdBuffer, pass == 0 ? g_vk.feature : g_vk.laterFeatures[pass], g_vk.capabilityParams,
             &input->ngx, depth, motion, &answer->ngx, workWidth, workHeight, guideWidth, guideHeight,
+            motionWidth, motionHeight, depthBaseX, depthBaseY, motionBaseX, motionBaseY,
             depthInverted ? 1 : 0, g_vk.reset ? 1 : 0, tuning.intensity,
             (int) Profiles::PassStyle(cfg, pass), tuning.structure, tuning.tone, tuning.skin,
-            tuning.autoMask ? 1 : 0, mvX, mvY);
+            tuning.autoMask ? 1 : 0, mvScaleX * mvToWorkX, mvScaleY * mvToWorkY);
+
         if (evaluated != 1)
             break;
+
         if (pass + 1 < passes)
         {
             input = answer;
@@ -1220,17 +1083,10 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         return;
     }
 
-    // -----------------------------------------------------------------------------------------
-    // Resolve: proxy + the model's answer + the untouched copy -> the frame
-    // -----------------------------------------------------------------------------------------
-
+    // Resolve Pass
     DlssNrConstants resolve = encode;
     resolve.Mode = DlssNrMode_Resolve;
 
-    // Supersampling down-leg (Vulkan). Average the Nx model answer back to native with the chosen
-    // filter so the resolve composites a native answer against the native proxy 1:1 -- not the single
-    // bilinear tap the Nx answer would otherwise get, which aliases the model's detail into noise. On
-    // failure it falls back to the Nx pair (modelInput + output), the old behaviour.
     OwnedImage* resolveProxy = modelInput;
     OwnedImage* resolveAnswer = answer;
 
@@ -1255,6 +1111,7 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
 
     if (beforeSr)
         Transition(cmdBuffer, g_vk.preColor, VK_IMAGE_LAYOUT_GENERAL);
+
     if (!g_vk.pass->Dispatch(cmdBuffer, resolve, width, height, resolveProxy->view, resolveAnswer->view,
                              g_vk.keep.view, VK_NULL_HANDLE,
                              beforeSr ? g_vk.preColor.view : colour->Resource.ImageViewInfo.ImageView,
@@ -1268,7 +1125,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
         Transition(cmdBuffer, g_vk.preColor, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     applied = true;
 
-    // Close it, and read the pair from three frames ago -- retired by now, so the read does not wait.
     if (g_vk.queryPool != VK_NULL_HANDLE)
     {
         vkCmdWriteTimestamp(cmdBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_vk.queryPool, timingSlot * 2 + 1);
@@ -1279,16 +1135,11 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
             const uint32_t readSlot = (uint32_t) (g_vk.timedFrames % kTimingSlots);
             uint64_t ticks[2] = {};
 
-            // Without WAIT: a slot this old is retired, and if it somehow is not, NOT_READY is the
-            // right answer rather than a stall.
             if (vkGetQueryPoolResults(device, g_vk.queryPool, readSlot * 2, 2, sizeof(ticks), ticks, sizeof(uint64_t),
                                       VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
                 ticks[1] > ticks[0])
             {
                 const double ms = (double) (ticks[1] - ticks[0]) * (double) g_vk.timestampPeriod / 1e6;
-
-                // A pass that appears to have taken over a second did not; the queue was reset under
-                // it or the pair straddled a device change.
                 if (ms > 0.0 && ms < 1000.0)
                     g_vk.lastGpuTime = ms;
             }
@@ -1296,7 +1147,6 @@ static void EvaluateAtSeamVk(VkCommandBuffer cmdBuffer, NVSDK_NGX_Parameter* par
     }
 
     static bool reported = false;
-
     if (!reported && g_vk.frames > 2)
     {
         reported = true;
@@ -1320,7 +1170,7 @@ void EvaluateAfterUpscaleVk(VkCommandBuffer cmd, NVSDK_NGX_Parameter* params, Vk
                             VkPhysicalDevice pd, VkDevice device, bool forcePost, bool ranBefore)
 {
     if (ranBefore)
-        return; // per-evaluate result, not a global frame counter that can suppress a different feature
+        return;
     bool applied = false;
     EvaluateAtSeamVk(cmd, params, instance, pd, device, false, forcePost, applied);
 }
@@ -1329,14 +1179,6 @@ void ShutdownVk(bool deviceAlive)
 {
     if (!deviceAlive)
     {
-        // The device these handles belong to is gone (a device change was detected). Destroying a
-        // VkDevice already frees every resource created on it, so touch NOTHING on the old device --
-        // no wait-idle, no vkDestroy*, no NGX release, and crucially no DlssNr_Vk destructor (it would
-        // vkDestroy its pipelines on the dead device). Abandon the handles; the driver reclaimed them
-        // when the device died. The one-off CPU-side leak of the pass object is the rare cost of a
-        // device recreation, and far cheaper than the use-after-free it replaces. Zeroing the
-        // OwnedImage/meter handles matters: the resize path gates on `.Valid()`, so a stale non-null
-        // handle from the dead device would be reused on the NEW device and crash.
         g_vk.pass.release();
         g_vk.superUp.release();
         g_vk.superDown.release();
@@ -1378,8 +1220,6 @@ void ShutdownVk(bool deviceAlive)
         return;
     }
 
-    // The device is alive (real teardown): drain before freeing so nothing the GPU is still using is
-    // destroyed under it, the same rule as the resize path.
     if (g_vk.device != VK_NULL_HANDLE)
         vkDeviceWaitIdle(g_vk.device);
 

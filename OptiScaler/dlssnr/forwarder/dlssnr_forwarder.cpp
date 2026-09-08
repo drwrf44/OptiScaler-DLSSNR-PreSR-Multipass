@@ -123,20 +123,6 @@ __declspec(dllexport) int dlssnr_call_last_create = 0;
 
 // ---------------------------------------------------------------------------------------------
 // Vulkan.
-//
-// The model ships a complete native Vulkan surface -- fourteen entry points against D3D12's ten --
-// so a Vulkan game does not need the D3D12 bridge the pass currently reaches it through. It needs
-// this: the same caller gate, because the snippet checks its caller's module path whichever API is
-// being used, and only this DLL has a name that satisfies it.
-//
-// Handles are passed as void*. Every Vulkan handle this touches -- instance, physical device,
-// device, command buffer -- is a dispatchable handle, which is a pointer on every 64-bit platform,
-// and taking them opaquely keeps the forwarder free of a Vulkan dependency it would otherwise carry
-// only to name types it never dereferences.
-//
-// Resources are the caller's problem for the same reason: NGX wants a pointer to an
-// NVSDK_NGX_Resource_VK, the host builds it, and this passes the pointer through the same 64-bit
-// parameter setter the D3D12 path uses for ID3D12Resource*.
 // ---------------------------------------------------------------------------------------------
 
 using PFN_NrVkInitExt = int(__cdecl *)(unsigned long long, const wchar_t *, void *, void *, void *,
@@ -175,28 +161,12 @@ bool loadVkSnippet(const wchar_t *path) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The model's own scaling ratio, asked for the way NVIDIA asks for it.
-//
-// The snippet publishes callbacks into a parameter block through PopulateParameters_Impl -- the same
-// mechanism DLSS uses for DLSSOptimalSettingsCallback. The strings in nvngx_dlssnr.dll spell the
-// contract out in order: DLSSNRComputeScalingRatioCallback, ComputeScalingRatioCommon,
-// PerfQualityValue, then the two failures "missing PerfQualityValue for DLSSNR scaling ratio
-// computation" and "unsupported PerfQualityValue %u ...", then DLSSNR.ScalingRatio itself.
-//
-// So: populate a block, read the callback out of it, set PerfQualityValue, call it, read the ratio
-// back. Read-only -- it creates no feature and changes no feature state, which is exactly why it is
-// worth doing before anything is built on the answer.
-//
-// It lives here rather than in the host because PopulateParameters_Impl is the snippet's own export
-// and the snippet resolves its caller's module path.
+// Scaling Ratio Query
 // ---------------------------------------------------------------------------------------------
 
 using PFN_NrPopulate = int(__cdecl *)(void *);
 using PFN_NrRatioCallback = int(__cdecl *)(void *);
 
-// Getters mirror setters eight slots up -- the same rule that put the resource getter at 8 opposite
-// the 64-bit setter at 0. A pointer published into the block is written as a 64-bit value, so it comes
-// back through slot 8; a float comes back through the discovered float slot plus eight.
 constexpr int VT_GET_ULL = VT_SET_ULL + 8;
 
 using PFN_GetULL = int(__thiscall *)(void *, const char *, unsigned long long *);
@@ -205,13 +175,6 @@ using PFN_GetFloat = int(__thiscall *)(void *, const char *, float *);
 __declspec(dllexport) int dlssnr_last_ratio_result = 0;
 __declspec(dllexport) int dlssnr_last_ratio_stage = 0;
 
-// Asks the model what resolution it wants for a given quality level.
-//
-// perfQuality is NVSDK_NGX_PerfQuality_Value: 0 MaxPerf, 1 Balanced, 2 MaxQuality, 3 UltraPerformance,
-// 4 UltraQuality, 5 DLAA. Returns 1 and writes outRatio on success. 0 means the callback was never
-// published, so the mechanism is not live in this snippet; -1 means it was published and refused, which
-// for this callback means the quality value is not one it supports. dlssnr_last_ratio_stage says how
-// far it got, so a zero can be told apart from a snippet that would not load at all.
 __declspec(dllexport) int dlssnr_query_scaling_ratio(const wchar_t *snippetPath, void *capabilityParams,
                                                      unsigned int perfQuality, float *outRatio) {
     dlssnr_last_ratio_stage = 0;
@@ -222,7 +185,6 @@ __declspec(dllexport) int dlssnr_query_scaling_ratio(const wchar_t *snippetPath,
 
     dlssnr_last_ratio_stage = 1;
 
-    // Publishing is what puts the callback in the block. Harmless if it has already happened.
     auto populate = (PFN_NrPopulate) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_PopulateParameters_Impl");
 
     if (populate != nullptr) {
@@ -243,11 +205,8 @@ __declspec(dllexport) int dlssnr_query_scaling_ratio(const wchar_t *snippetPath,
     dlssnr_last_ratio_stage = 3;
 
     setUInt(capabilityParams, "PerfQualityValue", perfQuality);
-
-    // Cleared first so a callback that writes nothing cannot be mistaken for one that wrote zero.
     setFloat(capabilityParams, "DLSSNR.ScalingRatio", -1.0f);
 
-    // Assigned rather than returned, for the same reason every other call through this module is.
     volatile int result = reinterpret_cast<PFN_NrRatioCallback>((void *) raw)(capabilityParams);
     dlssnr_last_ratio_result = (int) result;
 
@@ -270,30 +229,9 @@ __declspec(dllexport) int dlssnr_query_scaling_ratio(const wchar_t *snippetPath,
 }
 
 // ---------------------------------------------------------------------------------------------
-// Native Direct3D 11.
-//
-// The claim this tests is one nobody ever tested. "The model refuses to run on DX11, it answers
-// FeatureNotSupported" has been in the notes and the release text for a long time, and this forwarder
-// resolves no D3D11 entry point at all -- so whatever returned FeatureNotSupported, it was not the
-// snippet's own D3D11 path, because that path has never been called.
-//
-// The binary says it should exist. nvngx_dlssnr.dll exports ten D3D11 entry points, implemented in
-// source/features/dlssnr/ngx_d3d11.cpp, and its CreateFeature, EvaluateFeature and ReleaseFeature go
-// through the same CreateFeatureCommon / EvaluateFeatureCommon / ReleaseFeatureCommon in
-// ngx_templates.h that the D3D12 path uses. That is a real implementation sharing the same core, not
-// a stub.
-//
-// If it works, a D3D11 game does not need the bridge -- which is what currently forces those games to
-// give up DLSS as their upscaler, the biggest caveat in the whole feature.
-//
-// Probe first, exactly as the Vulkan path did: resolve the entry points and report which answer,
-// before anything is created.
+// Native Direct3D 11
 // ---------------------------------------------------------------------------------------------
 
-// The _Ext variant puts the version BEFORE the feature info. That is the entire difference between
-// NVSDK_NGX_D3D11_Init and NVSDK_NGX_D3D11_Init_Ext, and getting it backwards is not a wrong answer,
-// it is a fault: NGX would take the version as a pointer and dereference 0x15 to read PathListInfo.
-// The correct order is in this repo already, at proxies/NVNGX_Proxy.h.
 using PFN_NrD3D11Init = int(__cdecl *)(unsigned long long, const wchar_t *, void *, int, const void *);
 using PFN_NrD3D11Create = int(__cdecl *)(void *, int, const void *, void **);
 using PFN_NrD3D11Evaluate = int(__cdecl *)(void *, const void *, const void *, void *);
@@ -314,15 +252,6 @@ bool loadD3D11Snippet(const wchar_t *path) {
         return g_d3d11.create != nullptr;
     }
 
-    // Loading the same path twice does not give two modules -- Windows returns the same HMODULE with
-    // the reference count raised. So this would share one snippet's global NGX core with the D3D12
-    // path: one device pointer, one set of caches, two independent "initialised" flags over the top.
-    // Initialising it for D3D11 could then leave the D3D12 core holding a D3D11 device, which is a
-    // device removal rather than a wrong answer.
-    //
-    // A probe must not be able to break the thing it is probing, so it takes its own copy under a
-    // different name and the two cores never meet. If the copy cannot be made, the probe declines
-    // rather than falling back to the shared module.
     wchar_t probeCopy[MAX_PATH] = {};
     wchar_t probeDir[MAX_PATH] = {};
 
@@ -351,17 +280,6 @@ bool loadD3D11Snippet(const wchar_t *path) {
     return g_d3d11.create != nullptr && g_d3d11.evaluate != nullptr;
 }
 
-// Ask the feature what it needs, rather than asking the device to start it.
-//
-// GetFeatureRequirements is the query NGX provides for exactly this question, and unlike Init it
-// creates nothing and touches no device. A feature that genuinely does not run on an API answers here,
-// and it answers without our having to interpret a failure that might have been ours.
-//
-// Worth asking because the first attempt proved less than it looked. Init_Ext returned
-// FAIL_FeatureNotSupported, but the same process shows the driver's own NGX core initialising on
-// D3D11 successfully -- so D3D11 NGX works here, and it was specifically the snippet's own init,
-// called directly by us, that declined. The snippet carries the string "Error: Not called from NGX
-// runtime", which is a check we may simply be failing rather than a statement about the platform.
 using PFN_NrD3D11Requirements = int(__cdecl *)(const void *, const void *, void *);
 
 __declspec(dllexport) int dlssnr_d3d11_requirements(const wchar_t *snippetPath, void *adapter,
@@ -378,8 +296,6 @@ __declspec(dllexport) int dlssnr_d3d11_requirements(const wchar_t *snippetPath, 
         return -1;
     }
 
-    // NVSDK_NGX_FeatureDiscoveryInfo: SDK version, feature id, application identifier, log level,
-    // feature-specific info. Only the first two matter for the answer.
     struct {
         int sdkVersion;
         int featureId;
@@ -395,18 +311,11 @@ __declspec(dllexport) int dlssnr_d3d11_requirements(const wchar_t *snippetPath, 
     discovery.identifier.appId = 0x24480451ull;
     discovery.dataPath = L".";
 
-    // NVSDK_NGX_FeatureRequirement: the outputs. Generous so a longer struct cannot overrun.
     unsigned char requirement[512] = {};
-
-    // The adapter is not optional. Passing null the first time produced AdapterUnsupported, which
-    // reads like an answer about the hardware and is actually an answer about the question.
     volatile int result = req(adapter, &discovery, requirement);
 
     const unsigned int *out = reinterpret_cast<const unsigned int *>(requirement);
 
-    // NVSDK_NGX_FeatureRequirement: FeatureSupported bit field, then the minimum architecture, then
-    // the minimum OS version. The last two are worth having -- they say what it wanted, not just that
-    // it was unhappy.
     if (outFlags != nullptr) {
         *outFlags = out[0];
     }
@@ -425,8 +334,6 @@ __declspec(dllexport) int dlssnr_d3d11_requirements(const wchar_t *snippetPath, 
 __declspec(dllexport) int dlssnr_d3d11_last_init = 0;
 __declspec(dllexport) int dlssnr_d3d11_last_create = 0;
 
-// Which entry points resolved, as a bit field: init 1, create 2, evaluate 4, release 8. Fifteen means
-// the model's D3D11 surface is entirely reachable. Answered without creating anything.
 __declspec(dllexport) int dlssnr_d3d11_probe(const wchar_t *snippetPath) {
     loadD3D11Snippet(snippetPath);
 
@@ -439,27 +346,8 @@ __declspec(dllexport) int dlssnr_d3d11_probe(const wchar_t *snippetPath) {
     return bits;
 }
 
-// The non-_Ext init. Different export, and it puts the feature info before the version -- the reverse
-// of _Ext, which is the whole reason the two exist.
 using PFN_NrD3D11InitPlain = int(__cdecl *)(unsigned long long, const wchar_t *, void *, const void *, int);
 
-// Initialises NGX on a D3D11 device, four ways, reporting each.
-//
-// The feature itself says D3D11 is supported -- GetFeatureRequirements answers 0x0 with a minimum
-// architecture of Blackwell, which is the card this runs on. So a refusal from Init is about the
-// call, not the platform, and the candidates are few enough to try in one run:
-//
-//   1  _Ext on our own private copy of the snippet
-//   2  plain Init on that copy
-//   3  _Ext on the shared module the D3D12 path already initialised
-//   4  plain Init on that shared module
-//
-// Three and four use the module the D3D12 path owns. That is what the review warned against, because
-// one snippet keeps one global core and a D3D11 init could leave it holding a D3D11 device. They run
-// last, after D3D12 has had its turn, and only behind the flag -- but they are also the variants most
-// likely to work, since the snippet may expect to be reached through a core that is already up.
-//
-// Returns the first result that succeeds, or the last failure. attemptOut says which one answered.
 __declspec(dllexport) int dlssnr_d3d11_init(const wchar_t *snippetPath, const wchar_t *dataPath,
                                             void *device, int sdkVersion, int *attemptOut,
                                             int *resultsOut) {
@@ -541,8 +429,6 @@ __declspec(dllexport) int dlssnr_d3d11_init(const wchar_t *snippetPath, const wc
     return last;
 }
 
-// Creates the feature on a D3D11 device context. Tuning is set here for the same reason it is on the
-// other two paths: the model reads it once, when it builds the feature.
 __declspec(dllexport) void *dlssnr_d3d11_create(void *deviceContext, void *capabilityParams,
                                                 unsigned int width, unsigned int height, int preset,
                                                 float intensity, int style, float localStructure,
@@ -585,9 +471,6 @@ __declspec(dllexport) void dlssnr_d3d11_release(void *feature) {
 __declspec(dllexport) int dlssnr_vk_last_init = 0;
 __declspec(dllexport) int dlssnr_vk_last_create = 0;
 
-// Which of the four entry points resolved, as a bit field: init 1, create 2, evaluate 4, release 8.
-// 15 means the model's Vulkan surface is entirely reachable from here. Answered without creating
-// anything, so the host can decide whether the native path exists before committing to it.
 __declspec(dllexport) int dlssnr_vk_probe(const wchar_t *snippetPath) {
     loadVkSnippet(snippetPath);
 
@@ -611,9 +494,6 @@ __declspec(dllexport) int dlssnr_vk_init(const wchar_t *snippetPath, const wchar
         return 1;
     }
 
-    // Assigned rather than returned directly. A tail call becomes a jmp, and the snippet resolves its
-    // caller from the return address -- so tail calling hands it whoever called this instead of this
-    // module, and the caller gate rejects it before a single argument is read.
     volatile int result = g_vk.init(0x0, dataPath, instance, physicalDevice, device, nullptr, sdkVersion);
 
     dlssnr_vk_last_init = (int) result;
@@ -622,14 +502,6 @@ __declspec(dllexport) int dlssnr_vk_init(const wchar_t *snippetPath, const wchar
     return (int) result;
 }
 
-// Creates the feature on a Vulkan command buffer. Same contract as the D3D12 one: initialisation work
-// is recorded into the buffer, so the handle has to outlive its execution.
-// Creates the feature on a Vulkan command buffer. Same contract as the D3D12 one: initialisation work
-// is recorded into the buffer, so the handle has to outlive its execution.
-//
-// The tuning is set here and not at evaluate, for the same reason it is on the D3D12 path: the model
-// reads these once, when it builds the feature, and anything set only at evaluate is ignored. That was
-// why none of these controls did anything for a long time.
 __declspec(dllexport) void *dlssnr_vk_create(void *cmdBuffer, void *capabilityParams, unsigned int width,
                                              unsigned int height, int preset, float intensity, int style,
                                              float localStructure, float localTone, float skinStructure,
@@ -643,9 +515,6 @@ __declspec(dllexport) void *dlssnr_vk_create(void *cmdBuffer, void *capabilityPa
     setUInt(capabilityParams, "DLSSNR.Height", height);
     setUInt(capabilityParams, "CreationNodeMask", 1);
     setUInt(capabilityParams, "VisibilityNodeMask", 1);
-
-    // Written unconditionally, including zero. The block belongs to the driver and outlives the
-    // feature, so skipping the write for "default" leaves the last chosen preset sitting in it.
     setUInt(capabilityParams, "DLSSNR.Hint.Render.Preset", (unsigned int) preset);
 
     setFloat(capabilityParams, "DLSSNR.Intensity", intensity);
@@ -664,17 +533,14 @@ __declspec(dllexport) void *dlssnr_vk_create(void *cmdBuffer, void *capabilityPa
     return result == 1 ? feature : nullptr;
 }
 
-// Evaluates on Vulkan. Same parameter block as the D3D12 path, filled the same way and in the same
-// order, because it is the same feature -- only the four resources differ, and only in that each is a
-// pointer to an NVSDK_NGX_Resource_VK the host built rather than an ID3D12Resource. Both go through
-// the block's 64-bit setter, so the snippet sees the same shape either way.
-//
-// Filling it here rather than in the host keeps the two APIs from drifting: a parameter added to one
-// evaluate and forgotten in the other would be a bug that only appears on one backend.
+// Evaluates on Vulkan with Motion Vector Fix & Automatic Mask
 __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, void *capabilityParams,
                                              void *color, void *depth, void *motion, void *output,
                                              unsigned int width, unsigned int height,
                                              unsigned int guideWidth, unsigned int guideHeight,
+                                             unsigned int motionWidth, unsigned int motionHeight,
+                                             unsigned int depthBaseX, unsigned int depthBaseY,
+                                             unsigned int motionBaseX, unsigned int motionBaseY,
                                              int depthInverted, int reset, float intensity, int style,
                                              float localStructure, float localTone, float skinStructure,
                                              int useAutoMask, float mvScaleX, float mvScaleY) {
@@ -687,8 +553,6 @@ __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, voi
     setResourcePtr(capabilityParams, "DLSSNR.MVec", motion);
     setResourcePtr(capabilityParams, "DLSSNR.Output", output);
 
-    // The block is shared with the game's own DLSS, which overwrites these between frames, so every
-    // value the feature reads is set again here rather than relying on what create left behind.
     setUInt(capabilityParams, "DLSSNR.Enabled", 1);
     setUInt(capabilityParams, "DLSSNR.Width", width);
     setUInt(capabilityParams, "DLSSNR.Height", height);
@@ -703,17 +567,15 @@ __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, voi
     setUInt(capabilityParams, "DLSSNR.OutputSubrectBaseY", 0);
     setUInt(capabilityParams, "DLSSNR.OutputSubrectWidth", width);
     setUInt(capabilityParams, "DLSSNR.OutputSubrectHeight", height);
-    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseX", 0);
-    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseY", 0);
+    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseX", depthBaseX);
+    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseY", depthBaseY);
     setUInt(capabilityParams, "DLSSNR.DepthSubrectWidth", guideWidth);
     setUInt(capabilityParams, "DLSSNR.DepthSubrectHeight", guideHeight);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseX", 0);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseY", 0);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectWidth", guideWidth);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectHeight", guideHeight);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseX", motionBaseX);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseY", motionBaseY);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectWidth", motionWidth);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectHeight", motionHeight);
 
-    // The game's own encoding, passed through rather than derived. Deriving it from the resolutions
-    // came out as exactly 1.0 at native, which told the model almost nothing had moved.
     setFloat(capabilityParams, "DLSSNR.MVecScaleX", mvScaleX);
     setFloat(capabilityParams, "DLSSNR.MVecScaleY", mvScaleY);
 
@@ -724,8 +586,6 @@ __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, voi
     setFloat(capabilityParams, "DLSSNR.SkinStructureStrength", skinStructure);
     setAutomaticMask(capabilityParams, useAutoMask);
 
-    // Assigned rather than returned. A tail call becomes a jmp and the snippet would resolve its
-    // caller past this module, which the gate rejects.
     volatile int result = g_vk.evaluate(cmdBuffer, feature, capabilityParams, nullptr);
 
     return (int) result;
@@ -738,8 +598,6 @@ __declspec(dllexport) void dlssnr_vk_release(void *feature) {
     }
 }
 
-// Creates a persistent Neural Rendering feature. The handle records initialisation work into cmd, so it
-// must outlive that command list's execution; releasing it early loses the device.
 __declspec(dllexport) void *dlssnr_call_create(const wchar_t *snippetPath, const wchar_t *dataPath,
                                                ID3D12Device *device, ID3D12GraphicsCommandList *cmd,
                                                void *capabilityParams, unsigned int width,
@@ -751,9 +609,6 @@ __declspec(dllexport) void *dlssnr_call_create(const wchar_t *snippetPath, const
         return nullptr;
     }
     if (!g_snip.initialised && g_snip.init) {
-        // OptiScaler's own generic application id, the one it already hands DLSS when a game's id is
-        // not wanted. What was here before was 0x4350324B -- "CP2K" -- so every game that ever loaded
-        // this announced itself to the driver as Cyberpunk 2077.
         dlssnr_call_last_init = g_snip.init(0x24480451ull, dataPath, device, 0x0000015, capabilityParams);
         g_snip.initialised = (dlssnr_call_last_init == 1);
         if (!g_snip.initialised) {
@@ -765,14 +620,8 @@ __declspec(dllexport) void *dlssnr_call_create(const wchar_t *snippetPath, const
     setUInt(capabilityParams, "DLSSNR.Height", height);
     setUInt(capabilityParams, "CreationNodeMask", 1);
     setUInt(capabilityParams, "VisibilityNodeMask", 1);
-    // Written unconditionally, including zero. This block belongs to the driver and outlives the
-    // feature, so skipping the write for "default" left whichever preset was chosen last still sitting
-    // in it -- and going back to default did nothing at all.
     setUInt(capabilityParams, "DLSSNR.Hint.Render.Preset", (unsigned int) preset);
 
-    // The tuning has to be here rather than at evaluate. Everything this sets before create takes
-    // effect; everything set only at evaluate is ignored, which is why none of these controls did
-    // anything for a long time. The model reads them once, when it builds the feature.
     setFloat(capabilityParams, "DLSSNR.Intensity", intensity);
     setUInt(capabilityParams, "DLSSNR.Style", (unsigned int) style);
     setFloat(capabilityParams, "DLSSNR.LocalStructureStrength", localStructure);
@@ -782,18 +631,19 @@ __declspec(dllexport) void *dlssnr_call_create(const wchar_t *snippetPath, const
     setUInt(capabilityParams, "DLSSNR.UICorrection", (unsigned int) uiCorrection);
     void *handle = nullptr;
     dlssnr_call_last_create = g_snip.create(cmd, 18, capabilityParams, &handle);
-    // Match the DX11/Vulkan paths: a partial handle on failure is not usable.
     return dlssnr_call_last_create == 1 ? handle : nullptr;
 }
 
-// Colour and output are display resolution; depth and motion come from the game's own DLSS evaluation and
-// may be render resolution, so each resource carries its own subrect and motion scales by the ratio.
+// Evaluates on D3D12 with Motion Vector Fix & Automatic Mask
 __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, void *feature,
                                                void *capabilityParams, ID3D12Resource *color,
                                                ID3D12Resource *depth, ID3D12Resource *motion,
                                                ID3D12Resource *output, unsigned int width,
                                                unsigned int height, unsigned int guideWidth,
-                                               unsigned int guideHeight, int depthInverted, int reset,
+                                               unsigned int guideHeight, unsigned int motionWidth,
+                                               unsigned int motionHeight, unsigned int depthBaseX,
+                                               unsigned int depthBaseY, unsigned int motionBaseX,
+                                               unsigned int motionBaseY, int depthInverted, int reset,
                                                float intensity, int style, float localStructure,
                                                float localTone, float skinStructure, int useAutoMask,
                                                float mvScaleX, float mvScaleY) {
@@ -805,8 +655,6 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
     setResource(capabilityParams, "DLSSNR.MVec", motion);
     setResource(capabilityParams, "DLSSNR.Output", output);
 
-    // The block is shared with the game's own DLSS, which overwrites these between frames, so every
-    // value the feature reads is set again here rather than relying on what create left behind.
     setUInt(capabilityParams, "DLSSNR.Enabled", 1);
     setUInt(capabilityParams, "DLSSNR.Width", width);
     setUInt(capabilityParams, "DLSSNR.Height", height);
@@ -821,18 +669,15 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
     setUInt(capabilityParams, "DLSSNR.OutputSubrectBaseY", 0);
     setUInt(capabilityParams, "DLSSNR.OutputSubrectWidth", width);
     setUInt(capabilityParams, "DLSSNR.OutputSubrectHeight", height);
-    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseX", 0);
-    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseY", 0);
+    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseX", depthBaseX);
+    setUInt(capabilityParams, "DLSSNR.DepthSubrectBaseY", depthBaseY);
     setUInt(capabilityParams, "DLSSNR.DepthSubrectWidth", guideWidth);
     setUInt(capabilityParams, "DLSSNR.DepthSubrectHeight", guideHeight);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseX", 0);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseY", 0);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectWidth", guideWidth);
-    setUInt(capabilityParams, "DLSSNR.MVecSubrectHeight", guideHeight);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseX", motionBaseX);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectBaseY", motionBaseY);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectWidth", motionWidth);
+    setUInt(capabilityParams, "DLSSNR.MVecSubrectHeight", motionHeight);
 
-    // The game's own encoding, passed through. Deriving this from the resolutions was a guess, and at
-    // native resolution it came out as exactly 1.0 -- so a game using normalised vectors was telling
-    // the model almost nothing had moved.
     setFloat(capabilityParams, "DLSSNR.MVecScaleX", mvScaleX);
     setFloat(capabilityParams, "DLSSNR.MVecScaleY", mvScaleY);
 
@@ -843,19 +688,10 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
     setFloat(capabilityParams, "DLSSNR.SkinStructureStrength", skinStructure);
     setAutomaticMask(capabilityParams, useAutoMask);
 
-    // The result must not be returned directly. `return f(...)` is a tail call, and the compiler emits a
-    // jmp rather than a call, which leaves this module's frame behind: the snippet then resolves its
-    // caller to whoever called us and rejects it. Keeping the value in a volatile forces a real call and
-    // a return through this module, which is the whole reason this file exists.
     volatile int result = g_snip.evaluate(cmd, feature, capabilityParams, nullptr);
     return result;
 }
 
-// Inputs NVIDIA's own Streamline plugin sets that the positional exports predate: the model's global
-// tone strength (read at create), and the interface as the game draws it -- its layer, its alpha, and
-// the composited back buffer -- which is what the model's UI correction was designed around. Called
-// before create and before every evaluate; absent resources are written as null, because the block
-// outlives everything and a stale pointer is a freed resource.
 __declspec(dllexport) void dlssnr_call_set_extras(void *capabilityParams, float globalTone,
                                                   ID3D12Resource *ui, ID3D12Resource *uiAlpha,
                                                   ID3D12Resource *backbuffer, unsigned int uiWidth,
@@ -864,10 +700,6 @@ __declspec(dllexport) void dlssnr_call_set_extras(void *capabilityParams, float 
     if (!capabilityParams) {
         return;
     }
-    // DLSSNR.GlobalToneStrength is deliberately not written. The string does not appear anywhere in
-    // nvngx_dlssnr.dll -- the model's own vocabulary is 61 DLSSNR.* names and this is not one of them,
-    // so every write went into a map nothing reads. It exists in Streamline's sl.dlss_nr.dll, which is
-    // presumably where it was copied from. Left as a parameter here so the signature does not churn.
     (void) globalTone;
 
     setResource(capabilityParams, "DLSSNR.UI", ui);
@@ -889,7 +721,7 @@ __declspec(dllexport) void dlssnr_call_set_extras(void *capabilityParams, float 
 
 __declspec(dllexport) void dlssnr_call_release(void *feature) {
     if (feature && g_snip.release) {
-        volatile int result = g_snip.release(feature); // not a tail call, for the reason above
+        volatile int result = g_snip.release(feature);
         (void) result;
     }
 }

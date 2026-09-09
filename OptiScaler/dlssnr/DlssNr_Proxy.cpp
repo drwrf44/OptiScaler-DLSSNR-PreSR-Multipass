@@ -1,7 +1,6 @@
 #include "pch.h"
 #include "DlssNr_Proxy.h"
 
-
 #include <Config.h>
 #include <Logger.h>
 #include <proxies/NVNGX_Proxy.h>

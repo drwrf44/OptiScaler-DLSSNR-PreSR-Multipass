@@ -4,7 +4,6 @@
 #include <set>
 
 #include <dlssnr/DlssNr.h>
-#include <dlssnr/DlssNrNative.h>
 #include <dlssnr/ResidualFg.h>
 #include <DirectXMath.h>
 
@@ -2101,15 +2100,7 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
     std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
 
-    static unsigned lastPrecision = 0;
-    const unsigned precision = cfg.DlssNrPrecision.value_or_default();
-    if (lastPrecision != precision)
-    {
-        RetryAfterFailure();
-        DeferredSr::Cancel();
-        lastPrecision = precision;
-    }
-    DlssNrNative::SetPrecision(precision);
+    
 
     if (cfg.DlssNrEnabled.value_or_default() && cfg.DlssNrDeferredDlss.value_or_default() &&
         cfg.DlssNrAsyncLatest.value_or_default() && !forcePost)

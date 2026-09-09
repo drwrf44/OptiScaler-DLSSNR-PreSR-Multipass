@@ -148,8 +148,6 @@ struct NrState
     const int* lastRatioStage = nullptr;
     int* lastInit = nullptr;
     int* lastCreate = nullptr;
-    const char* (*lastModelError)() = nullptr;
-    std::string modelError;
 
     NVSDK_NGX_Parameter* capabilityParams = nullptr;
     void* feature = nullptr;
@@ -304,19 +302,6 @@ float WhitePointForMean(float meanLuma)
 
 std::filesystem::path g_dllDir;
 
-const char* SelectedModelFile()
-{
-    return "nvngx_dlssnr.dll";
-}
-
-std::optional<std::filesystem::path> FindSelectedModel()
-{
-    auto path = Util::FindFilePath(g_dllDir, SelectedModelFile());
-    if (!path.has_value())
-        path = Util::FindFilePath(Util::ExePath().remove_filename(), SelectedModelFile());
-    return path;
-}
-
 bool EnsureForwarder()
 {
     if (g_nr.forwarder != nullptr)
@@ -360,7 +345,6 @@ bool EnsureForwarder()
     g_nr.probeFloat = (PFN_NrProbeFloat) GetProcAddress(g_nr.forwarder, "dlssnr_call_probe_float");
     g_nr.lastInit = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_init");
     g_nr.lastCreate = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_create");
-    g_nr.lastModelError = (const char*(*)()) GetProcAddress(g_nr.forwarder, "dlssnr_call_error");
 
     if (g_nr.create == nullptr || g_nr.evaluate == nullptr)
     {
@@ -1339,7 +1323,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             LOG_ERROR("DLSS-NR: could not allocate the model-output ping-pong; extra passes are disabled");
     }
 
-    // FIX CHÍNH: Tạo colorSmall khi kích thước khác 100%
+    // FIX CHÍNH: Tạo colorSmall khi kích thước khác 100% (sửa từ != nullptr thành == nullptr)
     if (reduced && g_nr.colorSmall == nullptr)
         g_nr.colorSmall = CreateScratch(device, desc.Format, workWidth, workHeight);
 
@@ -1383,7 +1367,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_nr.feature == nullptr && g_nr.output != nullptr && g_nr.colorCopy != nullptr &&
         g_nr.hdrCopy != nullptr)
     {
-        auto snippet = FindSelectedModel();
+        auto snippet = Util::FindFilePath(g_dllDir, "nvngx_dlssnr.dll");
+        if (!snippet.has_value())
+            snippet = Util::FindFilePath(Util::ExePath().remove_filename(), "nvngx_dlssnr.dll");
+
         if (!snippet.has_value())
         {
             g_nr.failed = true;
@@ -1408,11 +1395,6 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             g_nr.featurePendingSubmission = false;
             g_nr.failed = true;
             g_nr.reason = "the model would not initialise";
-            if (g_nr.lastModelError && *g_nr.lastModelError())
-            {
-                g_nr.modelError = g_nr.lastModelError();
-                g_nr.reason = g_nr.modelError.c_str();
-            }
             const auto initResult = (unsigned int) (g_nr.lastInit != nullptr ? *g_nr.lastInit : 0);
             const auto createResult = (unsigned int) (g_nr.lastCreate != nullptr ? *g_nr.lastCreate : 0);
 
@@ -1430,7 +1412,6 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         g_nr.featurePendingSubmission = true;
         g_nr.featureCreateEpoch = frame.SubmissionEpoch;
         RecordBuiltPrimaryTuning(cfg);
-        LOG_INFO("DLSS-NR model feature created from {}", snippet->string());
         LOG_INFO("DLSS-NR running {}: target {}x{}, model {}x{}, guides {}x{} "
                  "(preset {}, intensity {}, style {}, build epoch {})",
                  frame.AfterRayReconstruction ? "after Ray Reconstruction" :
@@ -1494,11 +1475,14 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             if (g_nr.passFeature[pass] != nullptr) continue;
             if (g_nr.passCreateFailed[pass]) break;
 
-            auto snippet = FindSelectedModel();
+            auto snippet = Util::FindFilePath(g_dllDir, "nvngx_dlssnr.dll");
+            if (!snippet.has_value())
+                snippet = Util::FindFilePath(Util::ExePath().remove_filename(), "nvngx_dlssnr.dll");
+
             if (!snippet.has_value())
             {
                 g_nr.passCreateFailed[pass] = true;
-                LOG_ERROR("DLSS-NR: pass {} feature not built because {} disappeared", pass + 1, SelectedModelFile());
+                LOG_ERROR("DLSS-NR: pass {} feature not built because nvngx_dlssnr.dll disappeared", pass + 1);
             }
             else
             {
@@ -1736,6 +1720,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     ID3D12Resource* modelInput = g_nr.colorCopy;
 
+    // Quản lý upscaler/downscaler
     const Scaler nrScaler = cfg.DlssNrScalingDownscaler.value_or_default();
     if (g_nr.nrScaler != nrScaler)
     {
@@ -1792,15 +1777,12 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     if (depthIn == nullptr || motionIn == nullptr)
     {
-        g_nr.failed = true;
-        g_nr.reason = "the game's depth or motion vectors could not be made readable";
-        LOG_ERROR("DLSS-NR unavailable: {}", g_nr.reason);
         FinishColor(false);
         device->Release();
         return;
     }
 
-    // Motion vector reference space resolution calculation (accurate for Pre-SR and Post-SR)
+    // Motion vector reference space resolution calculation (works accurately for both Pre-SR and Post-SR)
     float mvSourceWidth = (float) wantedMotionWidth;
     float mvSourceHeight = (float) wantedMotionHeight;
 
@@ -1818,15 +1800,6 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             g_nr.guideMvScaleX * mvToWorkX, g_nr.guideMvScaleY * mvToWorkY);
 
         g_nr.reset = false;
-
-        if (proxyResult != 1)
-        {
-            g_nr.failed = true;
-            g_nr.reason = "the proxy path could not run the model";
-            LOG_ERROR("DLSS-NR (proxy): evaluate returned 0x{:X} ({}), disabling for this session",
-                      proxyResult, NgxResultName(proxyResult));
-        }
-
         FinishColor(proxyResult == 1);
         device->Release();
         return;
@@ -2084,8 +2057,6 @@ namespace DlssNr
 #include "DlssNr_DeferredSr.inl"
 #include "DlssNr_AsyncLatest.inl"
 
-std::string DeferredDlssStatus() { return SynchronousDeferredDlssStatus(); }
-
 void RetryAfterFailure()
 {
     g_nr.failed = false;
@@ -2099,8 +2070,6 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
 {
     std::lock_guard<std::recursive_mutex> nrLock(g_nrMutex);
     const Config& cfg = *Config::Instance();
-
-    
 
     if (cfg.DlssNrEnabled.value_or_default() && cfg.DlssNrDeferredDlss.value_or_default() &&
         cfg.DlssNrAsyncLatest.value_or_default() && !forcePost)
@@ -2119,7 +2088,6 @@ void EvaluateInternal(ID3D12GraphicsCommandList* cmdList, NVSDK_NGX_Parameter* p
         g_nr.reset = true;
         if (AsyncLatest::Draining()) return;
     }
-
     if (!cfg.DlssNrEnabled.value_or_default() || !cfg.DlssNrDeferredDlss.value_or_default() || forcePost)
         DeferredSr::Cancel();
     else

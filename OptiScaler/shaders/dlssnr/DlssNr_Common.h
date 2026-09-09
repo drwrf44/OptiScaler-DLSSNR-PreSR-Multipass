@@ -42,24 +42,9 @@ struct DlssNrResidualHold
 };
 
 // The meter's grid. 64 x 64 tiles over the whole frame, whatever its size.
-//
-// Tiles rather than pixels because the number wanted is where white sits, not how bright the
-// brightest pixel is: a single specular hit or a sky pixel is not the white point, and a frame's
-// maximum is exactly the statistic that would be dominated by one. Averaging each tile first means
-// anything smaller than a four-thousandth of the frame cannot decide the answer on its own.
-//
-// 4096 values is also small enough to read back and take a real percentile of on the CPU, rather
-// than approximating one on the GPU.
 constexpr uint32_t kDlssNrMeterGrid = 64;
 
 // What the caller knows about the frame, and the pass cannot work out for itself.
-//
-// Everything here is a property of how the game encodes its buffers, not a setting: the user's
-// choices -- preset, intensity, strengths, paper white -- stay in Config, so a caller placing this
-// pass in a new pipeline does not have to plumb a dozen sliders through it.
-//
-// Allocation sizes come from the resource descriptors. Before SR, the reported render subrect
-// also determines the active colour size; padded colour is copied through a compact work texture.
 struct DlssNrFrameInfo
 {
     // Which way round depth runs. The game states this when it creates its own upscaler.
@@ -95,13 +80,6 @@ struct DlssNrFrameInfo
     unsigned long long SubmissionEpoch = 0;
 
     // The game's own exposure: a 1x1 texture holding, in the SDK's words, "the final exposure scale".
-    //
-    // This is the number that makes a cave and a field comparable, and it is the reason a fixed paper
-    // white cannot serve both. It comes from the game, decided before anything here runs, so unlike a
-    // statistic measured off the frame it cannot be pulled around by what this pass writes.
-    //
-    // May be null on any given frame -- GTA V supplied it, then did not, three times in one session --
-    // so whoever consumes it holds the last good value rather than falling back to a default.
     void* ExposureTexture = nullptr;
 
     // The scale the game multiplied its buffer by for float precision, which DLSS is told so it can
@@ -110,15 +88,6 @@ struct DlssNrFrameInfo
 
     // How much of the depth and motion vector textures the game actually rendered into.
     // Before SR this also selects the origin-zero active colour rectangle, not its allocation.
-    //
-    // Not the same thing as how big those textures are, and the difference is the whole point. A game
-    // with dynamic resolution allocates its guides once at the largest size it will ever need and
-    // then renders into the top-left corner of them, telling the upscaler how much is real through
-    // DLSS.Render.Subrect.Dimensions. Sizing the guides from the resource instead means handing the
-    // model whatever was left in the margin -- stale depth and stale vectors -- and calling it scene.
-    //
-    // Zero means the game did not say, in which case the resource's own size is the best answer
-    // available and is what gets used.
     unsigned int RenderSubrectWidth = 0;
     unsigned int RenderSubrectHeight = 0;
 
@@ -133,15 +102,6 @@ struct DlssNrFrameInfo
     bool MotionVectorsLowResolution = false;
 };
 
-// What the composition shader reads.
-//
-// The model does not replace the frame. It is shown a tone-mapped proxy of the picture, and its
-// answer is transferred back onto the real frame -- so most of these describe how much of that answer
-// to take, not what the model should do.
-// Aligned to 256 because a constant buffer view's size must be a multiple of it. Without this the
-// buffer is created at the struct's natural size, the view is invalid, and the device is removed a
-// few milliseconds later -- with nothing in any log to say why. Every other shader here does the
-// same thing; it is not optional.
 struct alignas(256) DlssNrConstants
 {
     uint32_t Mode;
@@ -174,58 +134,32 @@ struct alignas(256) DlssNrConstants
     uint32_t GuideHeight;
 
     // Showing the pass against itself. 0 off, 1 side by side, 2 a wipe.
-    //
-    // Both are drawn by the resolve rather than by a pass of their own, because the resolve is the
-    // one place that already holds the frame as the upscaler produced it and the frame the model
-    // edited. Comparing them anywhere else would mean keeping a second copy of one of them.
     uint32_t CompareMode;
     float CompareSplit;
 
-    // How much of the frame side by side shows. 1 fits the whole thing at its right shape and
-    // letterboxes what is left over; 2 fills the half and crops to the middle instead.
+    // How much of the frame side by side shows.
     float CompareZoom;
 
-    // Which side the edited frame is on. Swapping matters because the eye is not even-handed about
-    // left and right, so a difference can look like an improvement purely from where it sits.
+    // Which side the edited frame is on.
     uint32_t CompareSwap;
 
     // How a model that worked below the frame's size is brought back. 0 classic, 1 matched residual.
-    //
-    // Classic composes the model's own low-resolution picture against the full-resolution frame, so
-    // the two disagree by the blur the downsample introduced as well as by the edit -- and the
-    // composition reads that disagreement as headroom the frame has and the model never saw. Matched
-    // residual takes only the model's *difference* from low resolution and lays it on the frame's own
-    // full-resolution proxy, so the two pictures being compared are at the same scale and the only
-    // thing carried up from small is the edit itself.
-    //
-    // The idea and the cube-scaled residual are hhkbble's, from the multi-pass PR against this fork.
     uint32_t Transfer;
 
     // What the debug views are multiplied by on their way out.
-    //
-    // They have to be scaled into the frame's units or the game's tonemapper shows them wrong, but
-    // scaling them by the live white point makes the instrument move with the thing being measured:
-    // two captures at different exposures then differ by the exposure, whatever the edit did. This
-    // is the user's own multiplier, which holds still while the meter works.
     float DebugScale;
 
-    // The reversible-proxy mode. 0 soft knee + our composition (default), 1 unclipped Neutwo proxy +
-    // our composition, 2 Neutwo proxy + pure-inverse replace (model's answer straight back, no
-    // composition). Trailing field, mirroring the shader's cbuffer, so the layout stays a flat run of
-    // 4-byte scalars that C++ and HLSL agree on.
+    // The reversible-proxy mode.
     uint32_t ReversibleMode;
 
-    // 0 = output the clean upscaler frame (the pass still runs, so Hold frame keeps a frozen frame
-    // to A/B against), 1 = apply the model's edit. Trailing scalar, mirrored in the shader cbuffer.
+    // 0 = output the clean upscaler frame, 1 = apply the model's edit.
     uint32_t ApplyModel;
 
-    // D3D12 source-1 zero-latency exposure. UseGameExposure = 1 makes the shader read the game's live
-    // exposure texture (bound at t4) instead of the CPU-resolved white point; ExposurePreMul is
-    // preExposure * trim, so the live white point is ExposurePreMul / exposure. Mirrored in the cbuffer.
+    // D3D12 source-1 zero-latency exposure.
     uint32_t UseGameExposure;
     float ExposurePreMul;
 
-    // Optional colour-based final-composition mask. Not the runtime's semantic mask.
+    // Optional colour-based final-composition mask.
     uint32_t SkinProtection;
     uint32_t ShowSkinMask;
     float SkinDetail;
@@ -237,11 +171,6 @@ struct alignas(256) DlssNrConstants
 class DlssNr_Common
 {
   protected:
-    // The model's own parameter names, spelled once.
-    //
-    // These are not ours to choose and they do not vary by API, which is the whole reason they are
-    // here rather than in the Direct3D 12 file. Getting one wrong is silent: the model keeps its
-    // previous value and the control simply appears to do nothing.
     static constexpr const char* kEnabled = "DLSSNR.Enabled";
     static constexpr const char* kWidth = "DLSSNR.Width";
     static constexpr const char* kHeight = "DLSSNR.Height";
@@ -256,27 +185,15 @@ class DlssNr_Common
     static constexpr const char* kMvScaleX = "DLSSNR.MVecScaleX";
     static constexpr const char* kMvScaleY = "DLSSNR.MVecScaleY";
 
-    // Read once, while the feature is built. Writing these only at evaluate does nothing at all,
-    // which is why several of them appeared to be dead controls for a long time.
     static constexpr const char* kPreset = "DLSSNR.Hint.Render.Preset";
     static constexpr const char* kIntensity = "DLSSNR.Intensity";
     static constexpr const char* kStyle = "DLSSNR.Style";
     static constexpr const char* kLocalStructure = "DLSSNR.LocalStructureStrength";
     static constexpr const char* kLocalTone = "DLSSNR.LocalToneStrength";
-    // Not a parameter of this model. Kept named so nobody re-adds it: a scan of nvngx_dlssnr.dll for
-    // DLSSNR.* yields 61 names and this is absent from them, while every other name here is present.
-    // Writing it was harmless -- the block is string-keyed -- but it made a control look real when
-    // nothing was listening, which is worse than not having one.
-    // static constexpr const char* kGlobalTone = "DLSSNR.GlobalToneStrength";
 
-    // Despite the name, this is the automatic *skin* mask, not an interface mask.
     static constexpr const char* kAutoMask = "DLSSNR.UseAutoMask";
-
-    // Defaults to -1, meaning follow local structure. It is not a 0..1 strength and -1 is not "off".
     static constexpr const char* kSkinStructure = "DLSSNR.SkinStructureStrength";
 
-    // The interface layer, its alpha, and the composited frame. The model accepts all three and is
-    // currently given none of them: with no interface supplied there is nothing to correct.
     static constexpr const char* kUi = "DLSSNR.UI";
     static constexpr const char* kUiAlpha = "DLSSNR.UIAlpha";
     static constexpr const char* kBackbuffer = "DLSSNR.Backbuffer";
